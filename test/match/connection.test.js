@@ -91,9 +91,10 @@ test('disconnect: the seat keeps playing; draft turns / prep auto-resolve at dea
   h.m.onDisconnect('p_1');
   assert.equal(m.publicView().players.find((p) => p.playerId === 'p_1').connected, false);
   m.handle('p_0', { t: 'g.infoReady' });
-  // p_1 never confirms: the 25 s deadline moves on; p_1 never picks: 12 s turn → 华法琳
+  // p_1 never confirms: the 25 s deadline moves on; the connected player picks first, then p_1 times out.
   h.drive(() => m.phase === PHASE.PREP && m.round === 1);
-  assert.equal(h.ps('p_1').bandId, 'band_bldsk');
+  assert.equal(h.ps('p_0').bandId, 'band_bldsk');
+  assert.equal(h.ps('p_1').bandId, 'band_amiya', 'the offline seat gets the next free strategy');
   const sentBefore = h.sent.length;
   // p_0 readies; p_1 is auto-readied at the prep deadline
   m.handle('p_0', { t: 'g.ready', ready: true });

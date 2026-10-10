@@ -547,7 +547,7 @@ export function makeCtx(m, ps, source, hook, ev = null) {
       const base = gd.baseIdOf(id);
       // "some effects fail when the cap is hit" (research 06 §7): by default a chess of the pool needs a free copy (a
       // 自选 piece: one of the player's own stock — player/diy.js poolOf)
-      const pool = typeof ps.poolOf === 'function' ? ps.poolOf(base) : m.pool;
+      const pool = typeof ps.poolOf === 'function' ? ps.poolOf(base) : ps.pool;
       if (opts.requirePool !== false && pool.has(base) && pool.left(base) < 1) return null;
       const p = ps.acquireChess(id, { source: opts.source || source.key || 'effect', toTemp: !!opts.toTemp, fromPool: opts.fromPool !== false });
       // 「歌蕾蒂娅：获得斯卡蒂」 — every silent grantChess (a 特质, 余 SERVER_MOST_BOND, a band, an item, a choice).
@@ -582,7 +582,7 @@ export function makeCtx(m, ps, source, hook, ev = null) {
         return typeof opts.filter === 'function' ? !!opts.filter(id) : true;
       };
       const extra = typeof ps.diyStockEntries === 'function' ? ps.diyStockEntries() : null;
-      return m.pool.roll(m.rngMeta, { maxTier: Number.isInteger(opts.maxTier) ? opts.maxTier : 6, tier: Number.isInteger(opts.tier) ? opts.tier : null, filter: f, extra });
+      return ps.pool.roll(m.rngMeta, { maxTier: Number.isInteger(opts.maxTier) ? opts.maxTier : 6, tier: Number.isInteger(opts.tier) ? opts.tier : null, filter: f, extra });
     },
     rollItem: (opts = {}) => m.rollItemId(opts),
     /**
@@ -593,7 +593,7 @@ export function makeCtx(m, ps, source, hook, ev = null) {
       shopLevel: ps.shop.level,
       // a shared-pool draw also takes the player's 自选 stock, its bonds read through the player's view (rollChess)
       extra: typeof ps.diyStockEntries === 'function' ? ps.diyStockEntries() : null, chessOf: (id) => gd.chess(id),
-      ...opts,
+      ...opts, player: ps,
     }),
     /**
      * Run another owned chess's 特质 of `eventType` now (SERVER_GAIN / SERVER_PREP_START / SERVER_PREP_FIN /

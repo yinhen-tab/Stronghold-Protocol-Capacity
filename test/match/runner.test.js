@@ -28,7 +28,7 @@ function fakeNet() {
   return n;
 }
 
-function rig({ hidden = false } = {}) {
+function rig({ hidden = false, loadSim = async () => ({ spec: specMod, ds: DS }) } = {}) {
   let t = 1000;
   const frames = [];
   const intervals = [];
@@ -42,7 +42,7 @@ function rig({ hidden = false } = {}) {
     caf: () => {},
     setInterval: (fn) => { intervals.push(fn); return intervals.length; },
     clearInterval: () => {},
-    loadSim: async () => ({ spec: specMod, ds: DS }),
+    loadSim,
     logger: { error() {}, warn() {}, info() {}, debug() {} },
   });
   const feed = { snaps: [], evs: [], fields: [] };
@@ -77,6 +77,25 @@ function realStart(seed = 7301) {
   h.run(() => h.m.phase === PHASE.COMBAT && h.m.round === 2, { maxSteps: 3e6 });
   const msg = h.lastTo('p_0', 'b.start');
   h.m.dispose();
+  return msg;
+}
+
+/** A real Match-generated boss spec, without simulating the preceding rounds. */
+function bossStart(seed = 7304) {
+  const h = makeMatch({ mode: 'solo', difficulty: 'FUNNY', humans: 1, seed, captureFrames: false,
+    clientCombat: true, clients: false, instant: false }).start();
+  h.toPrep(1);
+  h.setStage('act2autochess_m01');
+  h.m.round = h.m.gd.bossRound;
+  h.m.bossId = 'boss_1';
+  h.m._planBossWaves();
+  const ps = h.ps('p_0');
+  ps.board.set('10,8', ps.newPiece('chess', 'chess_char_1_01_a'));
+  ps.recompute();
+  h.m.startFinalAssault(false);
+  const msg = h.lastTo('p_0', 'b.start');
+  h.m.dispose();
+  assert.equal(msg?.kind, 'boss');
   return msg;
 }
 
@@ -124,6 +143,51 @@ test('authoritative battle: 2× pacing, ≤ max(8, 4·speed) ticks per frame, b.
   const b = validateClientResult(start.spec, specMod.compactResult(server), {});
   assert.ok(a.ok && b.ok);
   assert.equal(specMod.resultDigest(a.result).hash, specMod.resultDigest(b.result).hash, 'the browser result equals the server simulation');
+  r.runner.dispose();
+});
+
+test('the browser yields a result beyond the leak list cap without sending a truncated b.result', async () => {
+  const start = realStart(9421);
+  const r = rig();
+  r.net.emit('b.start', start);
+  await r.settle();
+  const e = r.runner._entries.get(start.battleId);
+  const raw = e.battle.result();
+  const pid = start.spec.players[0].playerId;
+  raw.perPlayer[pid].leaked = Array.from({ length: 401 }, () => ({ enemyKey: 'enemy_1007_slime', counted: true, sourcePlayerId: pid }));
+  raw.perPlayer[pid].perfect = false;
+  raw.perPlayer[pid].total = 401;
+  raw.total = 401;
+  e.battle.result = () => raw;
+  r.net.emit('b.end', { battleId: start.battleId, reason: 'forced' });
+  await r.settle();
+  assert.equal(e.deliveryType, 'b.yield');
+  assert.equal(r.net.sent.filter((x) => x.t === 'b.yield' && x.battleId === start.battleId).length, 1);
+  assert.equal(r.net.sent.filter((x) => x.t === 'b.result' && x.battleId === start.battleId).length, 0);
+  r.runner.dispose();
+});
+
+test('the browser yields a result that fits the character budget but exceeds 60 KiB in UTF-8 bytes', async () => {
+  const start = realStart(9422);
+  const r = rig();
+  r.net.emit('b.start', start);
+  await r.settle();
+  const e = r.runner._entries.get(start.battleId);
+  const raw = e.battle.result();
+  const pid = start.spec.players[0].playerId;
+  raw.perPlayer[pid].leaked = Array.from({ length: 250 }, () => ({ enemyKey: 'enemy_1007_slime',
+    mods: { identity: '中'.repeat(64) }, counted: true, sourcePlayerId: pid }));
+  raw.perPlayer[pid].perfect = false;
+  raw.perPlayer[pid].total = raw.total = 250;
+  const json = JSON.stringify({ t: 'b.result', battleId: start.battleId, result: specMod.compactResult(raw), rid: 2147483647 });
+  assert.ok(json.length < specMod.RESULT_FRAME_BUDGET, 'the old character count would allow the frame');
+  assert.ok(new TextEncoder().encode(json).length > specMod.RESULT_FRAME_BUDGET, 'the UTF-8 frame exceeds the network budget');
+  e.battle.result = () => raw;
+  r.net.emit('b.end', { battleId: start.battleId, reason: 'forced' });
+  await r.settle();
+  assert.equal(e.deliveryType, 'b.yield');
+  assert.equal(r.net.sent.filter((x) => x.t === 'b.yield').length, 1);
+  assert.equal(r.net.sent.filter((x) => x.t === 'b.result').length, 0);
   r.runner.dispose();
 });
 
@@ -187,13 +251,7 @@ test('b.end forced ends the local battle and reports at once; a new prep clears 
 });
 
 test('boss field: the local pool follows b.pool (server hp − unacknowledged local damage); progress carries bossDmg / by / leaks at 4 Hz', async () => {
-  const h = makeMatch({ mode: 'solo', difficulty: 'FUNNY', humans: 1, seed: 7304, captureFrames: false, clientCombat: true, clients: false });
-  h.autoHumans();
-  h.m.start();
-  h.run(() => h.ended != null || h.m.phase === PHASE.FINAL_ASSAULT, { maxSteps: 5e6 });
-  if (h.m.phase !== PHASE.FINAL_ASSAULT) { h.m.dispose(); return; } // (the seed did not reach the boss round)
-  const start = h.lastTo('p_0', 'b.start');
-  h.m.dispose();
+  const start = bossStart();
   assert.equal(start.kind, 'boss');
   const r = rig();
   r.net.emit('b.start', start);
@@ -208,7 +266,7 @@ test('boss field: the local pool follows b.pool (server hp − unacknowledged lo
   r.advance(3000);
   const first = r.net.sent.filter((x) => x.t === 'b.progress');
   assert.ok(first.length >= 10 && first.length <= 14, `4 Hz (${first.length} in 3 s)`);
-  // how soon the operators reach the leader depends on the board the autoplayed match built
+  // the fixed operator board must reach the real leader in this one field
   for (let i = 0; i < 30 && !(pool.cum > 0); i++) r.advance(1000);
   assert.ok(pool.cum > 0, 'local damage to the pool');
   const prog = r.net.sent.filter((x) => x.t === 'b.progress');
@@ -225,8 +283,46 @@ test('boss field: the local pool follows b.pool (server hp − unacknowledged lo
   assert.ok(Object.values(last.leaksBy).reduce((a, b) => a + b, 0) <= last.leaks + 1e-9);
   r.net.emit('b.pool', { hp: pool.maxHp * 0.5, max: pool.maxHp, teamLp: 20, acked: { [start.fieldId]: pool.cum } });
   assert.ok(Math.abs(pool.hp - pool.maxHp * 0.5) < 1e-6, 'server hp when everything is acknowledged');
+  const smallerMax = Math.round(pool.maxHp * 0.75);
+  r.net.emit('b.pool', { hp: Math.round(smallerMax * 0.5), max: smallerMax, teamLp: 20, acked: { [start.fieldId]: pool.cum } });
+  assert.equal(pool.maxHp, smallerMax, 'a departed player reduces the local leader maximum too');
+  assert.equal(pool.hp, Math.round(smallerMax * 0.5));
   r.runner.dispose();
 });
+
+for (const stage of ['loading', 'catch-up']) {
+  test(`b.pool during ${stage}: a Match-generated boss field receives the reduced HP and maximum`, async () => {
+    const start = bossStart();
+    const built = [];
+    let release;
+    const sim = { ds: DS, spec: { ...specMod, createBattleFromSpec: (...args) => {
+      const battle = specMod.createBattleFromSpec(...args);
+      built.push(battle);
+      return battle;
+    } } };
+    const loaded = new Promise((resolve) => { release = resolve; });
+    const r = rig({ loadSim: () => loaded });
+    r.net.emit('b.start', { ...start, elapsed: stage === 'catch-up' ? 30 : 0 });
+    if (stage === 'catch-up') {
+      release(sim);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(built.length, 1);
+      assert.equal(r.runner._entries.size, 0, 'the field is still in its first catch-up slice');
+    }
+    const max = start.spec.boss.poolMax * 0.75;
+    const hp = max * 0.5;
+    r.net.emit('b.pool', { hp, max, teamLp: 20, acked: { [start.fieldId]: built[0]?.sharedBoss.cum || 0 } });
+    if (stage === 'catch-up') {
+      assert.equal(built[0].sharedBoss.maxHp, max);
+      assert.equal(built[0].sharedBoss.hp, hp, 'the pending pool immediately applies the acknowledged server HP');
+    } else release(sim);
+    await r.settle();
+    const e = r.runner._entries.get(start.battleId);
+    assert.equal(e.battle.sharedBoss.maxHp, max, 'the prepared field retains the latest maximum');
+    if (stage === 'loading') assert.equal(e.battle.sharedBoss.hp, hp, 'the stale b.start HP is replaced before any ticks');
+    r.runner.dispose();
+  });
+}
 
 /** A fake net whose b.result requests follow a script: 'ok' | 'lost' (DISCONNECTED) | 'offline' | 'timeout' | 'refused'. */
 function scriptResults(r, script) {

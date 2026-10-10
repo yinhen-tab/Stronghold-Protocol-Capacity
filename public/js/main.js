@@ -47,12 +47,16 @@ import { GameScreen } from './screens/game.js';
 import { installAudio } from './audio.js';
 import { settingsStore } from './ui/settings.js';
 import { GuideHost } from './ui/guide.js';
+import { AnnouncementHost, installAnnouncements } from './ui/announcements.js';
+import { UrgentAnnouncementHost, installUrgentAnnouncements } from './ui/urgentAnnouncements.js';
+import { AssetCacheHost, installAssetCache } from './ui/assetCache.js';
 import { installDeviceSupport } from './ui/device.js';
 import { LoadoutHost } from './screens/loadout.js';
 import { StatsHost } from './screens/stats.js';
 import { recordResult, installStatsRecorder } from './ui/stats.js';
 import { installLoadoutSync, installOwnershipSync, installDiySync } from './ui/loadoutSync.js';
 import { startBuildGuard } from './ui/buildGuard.js';
+import { MAX_SEATS } from '../../shared/constants.js';
 import { initLang, useLang, tickerText } from './ui/lang.js';
 import { t, N_, translateWire } from '../../shared/i18n.js';
 import { recordError } from './diag.js';
@@ -60,7 +64,7 @@ import { recordError } from './diag.js';
 const RESTORE_GRACE_MS = 1500;
 const JOIN_DELAY_MS = 350;
 const TICKER_KEEP = 20;
-const EMOTE_KEEP = 20;
+const EMOTE_KEEP = MAX_SEATS * 4; // keep several seconds of messages even when every seat sends together
 
 const SCREENS = { title: TitleScreen, lobby: LobbyScreen, room: RoomScreen, game: GameScreen };
 
@@ -303,6 +307,9 @@ function App() {
     <${ToastHost} />
     <${UiHosts} />
     <${GuideHost} />
+    <${AnnouncementHost} />
+    <${UrgentAnnouncementHost} />
+    <${AssetCacheHost} />
     <${LoadoutHost} />
     <${StatsHost} />
   </div>`;
@@ -359,6 +366,9 @@ async function boot() {
   }));
 
   wireNet();
+  installAnnouncements({ appStore: store, selectRoute, net, restoreGraceMs: RESTORE_GRACE_MS });
+  installUrgentAnnouncements({ net });
+  installAssetCache();
   installStatsRecorder(store); // follows the match on screen, so a 放弃模拟 can be recorded (ui/stats.js)
   installLoadoutSync({ net });
   installOwnershipSync({ net });

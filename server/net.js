@@ -31,7 +31,7 @@
 //   onHello(session, { resumed, repeat })  after `welcome` was sent
 //   welcomeInfo() → object (optional)      extra fields of every `welcome` (never one of its own keys): the lobby's
 //                                          `diyKitted` (0.2.0 自选编队 — which operators a DIY slot may field)
-//   onMessage(session, msg) → { ok: true } | { error: ERR code, detail?: string } | undefined
+//   onMessage(session, msg) → { ok: true, reply?: object } | { error: ERR code, detail?: string } | undefined
 //   routeGame(session, msg) → same (optional): client-side combat reports `b.progress` / `b.result` (DESIGN §14) go
 //                                          straight to the running match through it; without it they reach onMessage
 //   onDisconnect(session)                  the session's socket closed (session kept for the reconnect window)
@@ -65,9 +65,10 @@ export const NET_DEFAULTS = Object.freeze({
  * room.loadout (a ≤ 160-entry map and ≤ 256 operator settings validated against the game data; the client debounces its
  * edits), room.ownership
  * (a ≤ 160-id list, the same way), room.diy (≤ 8 自选 picks checked against the data, the same way) and room.spectate
- * (taking a spectator seat in a running match resends its state like a watcher's g.watch — server/lobby.js spectate).
+ * (taking a spectator seat in a running match resends its state like a watcher's g.watch — server/lobby.js spectate),
+ * and lobby.watch with on:true/list:true (a paginated room directory, at most 50 rows per reply).
  */
-export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate']);
+export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate', 'lobby.watch']);
 
 /** Close codes (see header). */
 export const CLOSE = Object.freeze({ REPLACED: 4001, HELLO_TIMEOUT: 4002, POLICY: 1008, SHUTDOWN: 1001 });
@@ -612,7 +613,10 @@ export class Network {
     }
     if (msg.t === 'hello') { this.onHelloMsg(conn, msg, now); return; }
     if (!conn.session) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'hello required')); return; }
-    if (HEAVY_TYPES.has(msg.t) && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
+    // Lobby presence is a small summary and unsubscription is cleanup; only an opened paged directory
+    // consumes the heavy-response budget. This keeps a rapid close/route change from leaving a stale watcher.
+    const heavy = HEAVY_TYPES.has(msg.t) && !(msg.t === 'lobby.watch' && (!msg.on || !msg.list));
+    if (heavy && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
 
     let res;
     try {
@@ -630,7 +634,7 @@ export class Network {
       // surface as an error toast in the browser)
       if (msg.t === 'b.progress' && !validRid(rid)) return;
       this.reply(conn, errorMsg(isErrCode(res.error) ? res.error : ERR.INTERNAL, rid, res.detail));
-    } else if (validRid(rid)) this.reply(conn, { t: 'ok', rid });
+    } else if (validRid(rid)) this.reply(conn, res?.reply ? { ...res.reply, rid } : { t: 'ok', rid });
   }
 
   /** @param {Connection} conn @param {any} msg @param {number} now */

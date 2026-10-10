@@ -3,7 +3,7 @@
 // Every inbound JSON frame is appended to an inbox. `waitFor(type, predicate)` consumes the first matching
 // frame already in the inbox or the next one to arrive (so there is no race between an action and the
 // wait for its effect). `request(msg)` assigns a `rid` and resolves with the server's direct reply
-// (`ok` / `error` / `welcome` / `pong` carrying that rid).
+// (`ok` / `error` / `welcome` / `pong` / `lobby.state` carrying that rid).
 //
 //   const c = await TestClient.connect(`ws://127.0.0.1:${port}/ws`);
 //   const welcome = await c.hello('Doctor');
@@ -13,7 +13,7 @@
 
 import WebSocket from 'ws';
 
-const REPLY_TYPES = new Set(['ok', 'error', 'welcome', 'pong']);
+const REPLY_TYPES = new Set(['ok', 'error', 'welcome', 'pong', 'lobby.state']);
 
 export class TestClient {
   /**

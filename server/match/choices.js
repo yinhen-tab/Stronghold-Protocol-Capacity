@@ -2,8 +2,8 @@
 // data/choices.json).
 //
 // Generation (generateDraft): the family is a weighted pick from choices.schedule[modeId].rounds[r].families; the card
-// count is `cards` (co-op 6, solo 3):
-//   bounty  悬赏决策  six distinct cards.bounty entries (solo: 3 of them) built like the official draft of the round
+// count is `cards` (co-op six per fixed group, solo 3; training 6):
+//   bounty  悬赏决策  six distinct cards.bounty entries (solo: 3 of them), built like the official draft of the round
 //                     (`bountyDraftCards`; player feedback after 0.1.0, report #2 — late bounty enemies in the early
 //                     drafts; 66 official screenshots of 22 matches, tools/build-data.mjs BOUNTY_INITIAL_SETS): schedule
 //                     `bountyDraft` names the kind and choices.json `bountyDrafts[kind]` its card lists — the event is a
@@ -62,6 +62,7 @@
 //   cards with `team: true` apply to the picker AND every alive teammate ("若存在其他队友则他们也获得").
 
 import { weightedPick } from './waves.js';
+import { MAX_DRAFT_CARDS } from '../../shared/constants.js';
 
 export const FAMILY_NAMES = { bounty: '悬赏决策', supply: '道具补给', shop: '机密商店', tactic: '战术决策' }; // i18n-ignore: = choices.json families (the client shows the localized record)
 
@@ -133,14 +134,24 @@ function itemCard(gd, id) {
 }
 
 /**
- * Build the draft cards for an SP round.
- * @returns {{ family: string, name: string, desc: string, eventId: string|null, cards: object[] } | null}
+ * Select an event family with the round's original schedule weights, without generating its cards.
  */
-export function generateDraft(gd, rng, round, { stageId = null, bondAvailable = null } = {}) {
+export function selectDraftFamily(gd, rng, round) {
   const sch = scheduleFor(gd, round);
   const fams = Array.isArray(sch.families) && sch.families.length ? sch.families.map((f) => [f.family, f.weight]) : [['supply', 1]];
-  let family = weightedPick(rng, fams) || 'supply';
-  const n = Number.isInteger(sch.cards) && sch.cards > 0 ? Math.min(sch.cards, 6) : formatCount(gd);
+  return weightedPick(rng, fams) || 'supply';
+}
+
+/**
+ * Build the draft cards for an SP round.
+ * A supplied family bypasses the event roll; each call still draws a fresh page with the original card rules.
+ * @returns {{ family: string, name: string, desc: string, eventId: string|null, cards: object[] } | null}
+ */
+export function generateDraft(gd, rng, round, { stageId = null, bondAvailable = null, family: forcedFamily = null } = {}) {
+  const sch = scheduleFor(gd, round);
+  let family = forcedFamily ?? selectDraftFamily(gd, rng, round);
+  const scheduled = Number.isInteger(sch.cards) && sch.cards > 0 ? sch.cards : formatCount(gd);
+  const n = gd.isSolo ? Math.min(MAX_DRAFT_CARDS, scheduled) : MAX_DRAFT_CARDS;
   const opts = { stageId, bondAvailable, round };
   let cards = buildCards(gd, rng, family, n, sch, opts);
   if (!cards.length && family !== 'supply') { family = 'supply'; cards = buildCards(gd, rng, family, n, sch, opts); }
@@ -150,6 +161,29 @@ export function generateDraft(gd, rng, round, { stageId = null, bondAvailable = 
   const events = sch.events && Array.isArray(sch.events[family]) ? sch.events[family] : [];
   const eventId = events.length ? events[Math.floor(rng() * events.length)] : null;
   return { family, name: famInfo && famInfo.name ? famInfo.name : FAMILY_NAMES[family] || family, desc: famInfo && famInfo.desc ? famInfo.desc : '', eventId, cards };
+}
+
+/**
+ * Generate independent pages for the supplied active fixed groups, preserving their order and IDs.
+ * The whole match rolls its event family once; each group draws its cards independently with the original rules.
+ * Naturally identical pages are allowed, as are single-card overlaps and repeated positions within a page.
+ * `bondAvailable(bondId, group)` retains the caller's availability rules for that page.
+ * @returns {Array<{id: number, family: string, name: string, desc: string, eventId: string|null, cards: object[]}> | null}
+ */
+export function generateGroupDrafts(gd, rng, round, groups, { stageId = null, bondAvailable = null } = {}) {
+  if (!groups.length) return [];
+  const family = selectDraftFamily(gd, rng, round);
+  const drafts = [];
+  for (const group of groups) {
+    const draft = generateDraft(gd, rng, round, {
+      family,
+      stageId,
+      bondAvailable: typeof bondAvailable === 'function' ? (bondId) => bondAvailable(bondId, group) : null,
+    });
+    if (!draft) return null;
+    drafts.push({ id: group.id, ...draft });
+  }
+  return drafts;
 }
 
 /** Bond granted by a 驰援 tactic card (effect buff single_special_choice_gain_bond_chess), else null. */
@@ -386,7 +420,7 @@ function buildCards(gd, rng, family, n, sch, { stageId = null, bondAvailable = n
   if (family === 'bounty') return bountyDraftCards(gd, rng, n, sch, round);
   if (family === 'shop') {
     const cards = shopDraftCards(gd, rng, n, round);
-    if (cards) return cards;
+    if (cards && cards.length) return cards;
   }
   if (family === 'supply' || family === 'shop') {
     let lo = 1;
@@ -487,8 +521,8 @@ function applyDefault(m, ps, card) {
         const hasBond = (cid) => { const c = pgd.chess(cid); return !!(c && Array.isArray(c.bonds) && c.bonds.includes(bs.bond)); };
         for (let i = 0; i < count; i++) {
           const extra = typeof ps.diyStockEntries === 'function' ? ps.diyStockEntries() : null;
-          const id = m.pool.roll(m.rngMeta, { maxTier: Math.max(1, ps.shop.level), filter: hasBond, extra })
-            || m.pool.roll(m.rngMeta, { maxTier: 6, filter: hasBond, extra });
+          const id = ps.pool.roll(m.rngMeta, { maxTier: Math.max(1, ps.shop.level), filter: hasBond, extra })
+            || ps.pool.roll(m.rngMeta, { maxTier: 6, filter: hasBond, extra });
           if (id) ps.acquireChess(id, { source: 'choice' });
         }
         handled = true;

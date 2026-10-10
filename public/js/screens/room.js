@@ -1,6 +1,7 @@
-// Room screen (同盟等待室): 4 seat cards (avatar frame, name, ready state, AI badge, host crown),
-// host controls (difficulty picker, add/remove AI and the 「AI 队友最后选择」 switch in co-op, start), invite code with
-// copy code / copy link, ready toggle and leave.
+// Room screen (同盟等待室): configurable seat cards (avatar frame, name, ready state, AI badge, host crown),
+// host controls (difficulty picker, add/remove AI in co-op, start), invite code with copy code /
+// copy link, ready toggle and leave.
+// The capacity branch keeps manual humans first within every fixed draft group (D004); the room shows it read-only.
 //
 // Start rule (server/lobby.js): room.start needs every *other* human connected and ready; the
 // host's start counts as the host's ready. So 开始模拟 is enabled exactly then and sends room.start
@@ -12,13 +13,14 @@
 // Texts go through t() (docs/I18N.md).
 
 import { useEffect, useRef, useState } from '../../vendor/hooks.module.js';
-import { DIFFICULTIES, DIFFICULTY_NAMES, DIFFICULTY_COLORS, MAX_SEATS, MAX_SPECTATORS } from '../../../shared/constants.js';
+import { DIFFICULTIES, DIFFICULTY_NAMES, DIFFICULTY_COLORS, MAX_SEATS, DEFAULT_SEATS, ROOM_CAPACITIES, MAX_SPECTATORS } from '../../../shared/constants.js';
 import {
   html, Button, Icon, MicroLabel, PingPill, AvatarFrame, DifficultyTag, DifficultyIcon, Tooltip, confirmDialog, doctorNo,
 } from '../ui/components.js';
 import { toast, toastError } from '../ui/toasts.js';
 import { copyText } from '../ui/clipboard.js';
 import { GuideButton } from '../ui/guide.js';
+import { AssetCacheButton } from '../ui/assetCache.js';
 import { openStats } from './stats.js';
 import { SettingsButton } from '../ui/settings.js';
 import { LoadoutButton } from './loadout.js';
@@ -28,13 +30,14 @@ import { difficultyInfo } from './lobby.js';
 import { t, tc } from '../../../shared/i18n.js';
 
 /**
- * Seats padded to the room's capacity (co-op 4, solo 1), each null or a seat record.
+ * Seats padded to the room's capacity (co-op 4–20, solo 1), each null or a seat record.
  * @param {any} room room.state payload
  * @returns {(null | {seat:number, playerId:any, name:string, isBot:boolean, ready:boolean, connected:boolean})[]}
  */
 export function normalizeSeats(room) {
-  const cap = room?.mode === 'solo' ? 1 : MAX_SEATS;
   const src = Array.isArray(room?.seats) ? room.seats : [];
+  const requested = Number.isInteger(room?.capacity) ? room.capacity : src.length || DEFAULT_SEATS;
+  const cap = room?.mode === 'solo' ? 1 : Math.max(1, Math.min(MAX_SEATS, requested));
   const out = [];
   for (let i = 0; i < cap; i++) {
     const s = src[i];
@@ -72,16 +75,15 @@ export function roomFacts(room, myId) {
 }
 
 /**
- * The co-op room option 「AI 队友最后选择」 (GitHub #338; room.setAiPicksLast, room.state.aiPicksLast): in the strategy and
- * 机变 drafts every human picks before the AI teammates. null in a solo room (no AI teammates); otherwise its state (off
- * when the server sends none) and whether this player may switch it — the host only, the others see it read-only.
+ * The upstream 「AI 队友最后选择」 indicator follows D004 in this branch: online manual humans choose before AI,
+ * managed and disconnected seats within each fixed group. Solo rooms have no teammates; co-op always shows it on
+ * and read-only, including frames from an older server that omit the flag.
  * @param {any} room room.state payload
- * @param {any} myId
  * @returns {{ on: boolean, editable: boolean } | null}
  */
-export function aiLastOption(room, myId) {
+export function aiLastOption(room) {
   if (!room || room.mode === 'solo') return null;
-  return { on: room.aiPicksLast === true, editable: room.hostId != null && room.hostId === myId };
+  return { on: true, editable: false };
 }
 
 /** Invite link for a room code (current page URL with ?room=CODE). */
@@ -204,18 +206,32 @@ function DifficultyPicker({ room, isHost, busy, onPick }) {
   </div>`;
 }
 
-/** The 「AI 队友最后选择」 switch (co-op): the host toggles it, everybody else sees its state. */
-function AiLastToggle({ option, busy, onToggle }) {
+function CapacityPicker({ room, facts, busy, onPick }) {
+  const capacity = room.capacity || facts.seats.length;
+  const minCapacity = Math.max(1, ...facts.occupied.map((s) => s.seat + 1));
+  return html`<div class="room-capacity" aria-label=${t('同盟席位')}>
+    <span class="room-capacity__label">${t('人数上限')} <b class="num">${capacity}</b> ${t('人')}</span>
+    ${facts.isHost ? html`<div class="room-capacity__options" role="radiogroup" aria-label=${t('调整同盟人数上限')}>
+      ${ROOM_CAPACITIES.map((n) => html`<button key=${n} type="button" role="radio" aria-checked=${capacity === n ? 'true' : 'false'}
+        class=${`room-capacity__opt${capacity === n ? ' is-active' : ''}`} disabled=${!!busy || n < minCapacity}
+        title=${n < minCapacity ? t('先移除超出席位的玩家') : t('{n} 人房间', { n })}
+        onClick=${() => n !== capacity && onPick(n)}>${n}</button>`)}
+    </div>` : html`<span class="t-dim">${t('由创建者设置')}</span>`}
+    <span class="room-capacity__count num">${facts.occupied.length} / ${capacity}</span>
+  </div>`;
+}
+
+/** D004 is a fixed co-op rule, including managed and disconnected human seats after manual humans. */
+function AiLastRule({ option }) {
   if (!option) return null;
   return html`<div class="ailast">
-    <${Tooltip} text=${t('策略与机变轮选时，所有博士先于 AI 队友选择')}>
+    <${Tooltip} text=${t('本分支固定由在线且未托管的博士先选，AI、托管和掉线席位随后选择')}>
       <button type="button" role="switch" aria-checked=${option.on ? 'true' : 'false'}
-          class=${`dpick__opt ailast__opt${option.on ? ' is-active' : ''}`} disabled=${!option.editable || !!busy}
-          onClick=${() => option.editable && onToggle(!option.on)}>
+          class=${`dpick__opt ailast__opt${option.on ? ' is-active' : ''}`} disabled=${true}>
         <${Icon} name="check" class=${option.on ? 'is-on' : ''} />${t('AI 队友最后选择')}
       </button>
     <//>
-    ${option.editable ? null : html`<span class="t-dim">${t('由创建者设置')}</span>`}
+    <span class="t-dim">${t('固定规则')}</span>
   </div>`;
 }
 
@@ -259,7 +275,7 @@ export function RoomScreen() {
     if (ok) run(`kick${seat}`, () => net.request('room.kick', { seat, playerId }));
   };
   const setDifficulty = (difficulty) => run('diff', () => net.request('room.setDifficulty', { difficulty }));
-  const setAiLast = (on) => run('ailast', () => net.request('room.setAiPicksLast', { on }));
+  const setCapacity = (capacity) => run('capacity', () => net.request('room.setCapacity', { capacity }));
   // spectator seats: the host frees one; a spectator takes a free player seat with room.join of this room
   const removeSpectator = (playerId) => run(`rs${playerId}`, () => net.request('room.removeSpectator', { playerId }));
   const sit = () => run('sit', () => net.request('room.join', { code: room.code }));
@@ -301,6 +317,7 @@ export function RoomScreen() {
   return html`<div class="screen room-screen">
     <header class="topbar">
       <div class="topbar__left">
+        <${AssetCacheButton} compact=${true} />
         <${Tooltip} text=${t('离开同盟')} placement="bottom">
           <${Button} variant="danger" size="lg" square=${true} icon="exit" loading=${busy === 'leave'} onClick=${leave} aria-label=${t('离开同盟')} />
         <//>
@@ -321,7 +338,8 @@ export function RoomScreen() {
       </div>
     </header>
 
-    <main class=${`seats${coop ? '' : ' seats--solo'}`}>
+    ${coop ? html`<${CapacityPicker} room=${room} facts=${facts} busy=${busy} onPick=${setCapacity} />` : null}
+    <main class=${`seats${coop ? facts.seats.length > 10 ? ' seats--dense' : facts.seats.length > 4 ? ' seats--expanded' : '' : ' seats--solo'}${coop && facts.seats.length === 10 ? ' seats--ten' : ''}`}>
       ${facts.seats.map((s, i) => html`<${SeatCard} key=${s ? `p${s.playerId}` : `e${i}`} seat=${s} index=${i} room=${room} facts=${facts}
         myId=${me.playerId} busy=${busy} onAddBot=${addBot} onRemoveBot=${removeBot} onKick=${kick} />`)}
       ${coop ? null : html`<aside class="solo-brief brackets">
@@ -342,16 +360,16 @@ export function RoomScreen() {
         <span class="room-bar__label">${t('模拟难度')}<${MicroLabel}>DIFFICULTY<//></span>
         <div class="room-bar__opts">
           <${DifficultyPicker} room=${room} isHost=${facts.isHost} busy=${busy} onPick=${setDifficulty} />
-          <${AiLastToggle} option=${aiLastOption(room, me.playerId)} busy=${busy} onToggle=${setAiLast} />
+          <${AiLastRule} option=${aiLastOption(room)} />
         </div>
       </div>
       <div class="room-bar__center">
         <div class="ready-count" hidden=${!coop}>
           <span class="t-lo">${t('已就绪')}</span>
           <b class="num">${facts.readyHumans}</b><span class="num t-dim">/${facts.humans.length}</span>
-          <span class="ready-count__icons" aria-hidden="true">
+          ${facts.humans.length <= 8 ? html`<span class="ready-count__icons" aria-hidden="true">
             ${facts.humans.map((s) => html`<${Icon} key=${s.playerId} name="user" class=${facts.isReady(s) ? 'is-on' : ''} />`)}
-          </span>
+          </span>` : null}
         </div>
         <div class="room-bar__status">${statusLine}</div>
       </div>

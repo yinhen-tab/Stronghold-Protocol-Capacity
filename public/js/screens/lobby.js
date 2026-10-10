@@ -13,10 +13,12 @@
 
 import { ResumeMatchButton } from '../ui/resumeMatch.js';
 import { useEffect, useRef, useState } from '../../vendor/hooks.module.js';
-import { DIFFICULTIES, DIFFICULTY_NAMES, DIFFICULTY_COLORS, ROOM_CODE_LEN, MAX_SEATS, MAX_SPECTATORS, modeIdFor, ERR } from '../../../shared/constants.js';
+import { DIFFICULTIES, DIFFICULTY_NAMES, DIFFICULTY_COLORS, ROOM_CODE_LEN, MAX_SEATS, DEFAULT_SEATS, ROOM_CAPACITIES, MAX_SPECTATORS, modeIdFor, ERR } from '../../../shared/constants.js';
 import { html, Button, Icon, MicroLabel, Panel, TextField, PingPill, AvatarFrame, Tooltip, Spinner, DifficultyIcon, doctorNo } from '../ui/components.js';
 import { toast, toastError } from '../ui/toasts.js';
 import { GuideButton } from '../ui/guide.js';
+import { AnnouncementButton } from '../ui/announcements.js';
+import { AssetCacheButton } from '../ui/assetCache.js';
 import { openStats } from './stats.js';
 import { SettingsButton } from '../ui/settings.js';
 import { PwaInstallButton } from '../ui/device.js';
@@ -25,6 +27,8 @@ import { net, identity } from '../net.js';
 import { store, useStore, shallowEqual, loadPref, savePref } from '../store.js';
 import { getConfig, getMode, getStage, useData } from '../data.js';
 import { t, tc, N_ } from '../../../shared/i18n.js';
+import { createLobbyDiscovery } from '../lobbyDiscovery.js';
+import { LobbyOnlinePill, LobbyDiscoveryPanel, LobbyRoomList } from '../ui/lobbyDiscovery.js';
 
 /** Official mode texts (activity_table act2autochess.modeDataDict), fallback when config.json is absent. */
 export const MODE_TEXT = {
@@ -83,7 +87,7 @@ const MODE_CARDS = [
   },
   {
     id: 'coop', name: N_('同盟模拟'), en: 'ALLIANCE SIMULATION', icon: 'users',
-    desc: N_('与至多 {n} 名博士组成同盟，共享干员池，联防协作抵御敌潮。'), params: { n: MAX_SEATS - 1 },
+    desc: N_('与至多 {n} 名博士组成同盟，分组共享干员池，联防协作抵御敌潮。'), params: { n: MAX_SEATS - 1 },
     points: [N_('1–{n} 名博士 · 可由 AI 队友补位'), N_('联防阶段 · 最终攻势合并生命值')], pointParams: { n: MAX_SEATS },
   },
 ];
@@ -249,18 +253,35 @@ export function LobbyScreen() {
     const d = loadPref('lobby.difficulty', 'FUNNY');
     return DIFFICULTIES.includes(d) ? d : 'FUNNY';
   });
+  const [capacity, setCapacity] = useState(() => {
+    const saved = loadPref('lobby.capacity', DEFAULT_SEATS);
+    return ROOM_CAPACITIES.includes(saved) ? saved : DEFAULT_SEATS;
+  });
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(null);
+  const discoveryRef = useRef(null);
+  if (!discoveryRef.current) discoveryRef.current = createLobbyDiscovery({ net });
+  const discovery = discoveryRef.current;
+  const discoveryState = useStore((s) => s, shallowEqual, discovery.target);
+  const [matchCapacity, setMatchCapacity] = useState(() => {
+    const saved = loadPref('lobby.matchCapacity', null);
+    return ROOM_CAPACITIES.includes(saved) ? saved : null;
+  });
   const [recent] = useState(recentRooms);
   const alive = useRef(true);
   const inFlight = useRef(false); // synchronous guard against double clicks (state updates are async)
   useEffect(() => () => { alive.current = false; }, []);
+  useEffect(() => {
+    discovery.start();
+    return () => discovery.dispose();
+  }, [discovery]);
 
   const online = conn.status === 'online';
   const codeOk = CODE_RE.test(code);
 
   const pickMode = (m) => { setRoomMode(m); savePref('lobby.mode', m); };
   const pickDifficulty = (d) => { setDifficulty(d); savePref('lobby.difficulty', d); };
+  const pickCapacity = (n) => { setCapacity(n); savePref('lobby.capacity', n); };
 
   const run = async (kind, fn) => {
     if (inFlight.current) return;
@@ -272,7 +293,12 @@ export function LobbyScreen() {
       if (alive.current) setBusy(null);
     }
   };
-  const create = () => run('create', () => net.request('room.create', { mode: roomMode, difficulty }));
+  const create = () => run('create', () => net.request('room.create', { mode: roomMode, difficulty, ...(roomMode === 'coop' ? { capacity } : {}) }));
+  const quickMatch = () => run('quickMatch', () => net.request('lobby.quickMatch', matchCapacity ? { capacity: matchCapacity } : {}).catch((err) => {
+    if (err?.code === ERR.ROOM_NOT_FOUND) { toast(t('暂无可加入的房间，请稍后重试或创建同盟。'), 'warn'); return; }
+    throw err;
+  }));
+  const directoryJoin = (roomCode) => run('directoryJoin', () => net.request('room.join', { code: roomCode }));
   const join = (c = code) => {
     // `onClick=${join}` hands the click EVENT as the first argument, and a default parameter only applies to
     // `undefined` — codeArg keeps an event target out of the key and falls back to the input field
@@ -309,12 +335,15 @@ export function LobbyScreen() {
       <div class="topbar__left">
         <${Button} variant="ghost" size="sm" icon="chevronLeft" onClick=${backToTitle} title=${t('返回标题')}>${t('返回')}<//>
         <${PingPill} ms=${conn.ping} online=${online} />
+        <${LobbyOnlinePill} count=${discoveryState.online} connected=${online} />
+        <${AssetCacheButton} />
       </div>
       <div class="topbar__center">
         <${MicroLabel} tone="mint">SIMULATION PROTOCOL SELECT<//>
         <h1 class="topbar__title">${t('选择模拟协议')}</h1>
       </div>
       <div class="topbar__right">
+        <${AnnouncementButton} variant="secondary" />
         <${Button} variant="secondary" size="sm" icon="chart" class="stats-entry" onClick=${openStats} title=${t('统计数据')} aria-label=${t('统计数据')}>${t('统计')}<//>
         <${ResumeMatchButton} />
         <${PwaInstallButton} class="lobby-pwa" />
@@ -337,6 +366,10 @@ export function LobbyScreen() {
         <div class="mode-cards">
           ${MODE_CARDS.map((c) => html`<${ModeCard} key=${c.id} card=${c} selected=${roomMode === c.id} onSelect=${pickMode} />`)}
         </div>
+
+        <${LobbyDiscoveryPanel} state=${discoveryState} connected=${online} capacity=${matchCapacity}
+          onCapacity=${(n) => { setMatchCapacity(n); savePref('lobby.matchCapacity', n); }}
+          onOpen=${() => discovery.show()} onQuickMatch=${quickMatch} busy=${busy === 'quickMatch'} />
 
         <div class="section-label"><span class="section-label__idx num">03</span>${t('加入同盟')}<${MicroLabel}>JOIN WITH ALLIANCE KEY<//></div>
         <${Panel} class="join-panel" tone="amber">
@@ -363,6 +396,13 @@ export function LobbyScreen() {
         <div class="diff-list">
           ${DIFFICULTIES.map((d) => html`<${DifficultyCard} key=${d} roomMode=${roomMode} difficulty=${d} selected=${difficulty === d} onSelect=${pickDifficulty} />`)}
         </div>
+        ${roomMode === 'coop' ? html`<div class="capacity-select">
+          <div class="capacity-select__label">${t('同盟席位')} <${MicroLabel}>ROOM CAPACITY<//></div>
+          <div class="capacity-select__options" role="radiogroup" aria-label=${t('同盟人数上限')}>
+            ${ROOM_CAPACITIES.map((n) => html`<button key=${n} type="button" role="radio" aria-checked=${capacity === n ? 'true' : 'false'}
+              class=${`capacity-select__opt${capacity === n ? ' is-active' : ''}`} onClick=${() => pickCapacity(n)}>${t('{n} 人', { n })}</button>`)}
+          </div>
+        </div>` : null}
         <div class="create-box">
           <${Tooltip} block=${true} text=${online ? null : t('正在连接服务器…')}>
             <${Button} variant="primary" size="xl" block=${true} iconRight="chevrons" loading=${busy === 'create'} disabled=${!online} onClick=${create}>
@@ -377,5 +417,8 @@ export function LobbyScreen() {
         </div>
       </section>
     </div>
+    ${discoveryState.open ? html`<${LobbyRoomList} state=${discoveryState} connected=${online}
+      onClose=${() => discovery.close()} onRefresh=${() => discovery.refresh()} onPage=${(page) => discovery.page(page)}
+      onJoin=${directoryJoin} busy=${!!busy} />` : null}
   </div>`;
 }

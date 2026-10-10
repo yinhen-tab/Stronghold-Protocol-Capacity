@@ -47,13 +47,27 @@ export async function act(t, fields = {}, opts = {}) {
   }
 }
 
+/** Legacy/dev frames may lack identity; omit absent guards rather than sending protocol-invalid nulls. */
+export function draftRequestScope({ draftId, groupId } = {}) {
+  return { ...(draftId != null ? { draftId } : {}), ...(groupId != null ? { groupId } : {}) };
+}
+
+/**
+ * Personal PREP choices use choiceId; public group drafts use draftId / groupId.
+ * @param {string|{ choiceId?: string|null, draftId?: string|null, groupId?: number|null }} [opts]
+ */
+export function choiceRequestScope(opts = {}) {
+  if (typeof opts === 'string') return { choiceId: opts };
+  return { ...draftRequestScope(opts), ...(opts.choiceId != null ? { choiceId: opts.choiceId } : {}) };
+}
+
 export const actions = {
   infoReady: (setupRevision = 0) => act('g.infoReady', { setupRevision }),
   rerollSetup: (setupRevision) => act('room.rerollSetup', { setupRevision }, { sfx: 'confirm' }),
   rerollVote: (voteId, agree) => act('g.rerollVote', { voteId, agree }, { sfx: agree ? 'confirm' : 'back' }),
   cancelReroll: (voteId) => act('room.cancelReroll', { voteId }, { sfx: 'back' }),
-  band: (bandId) => act('g.band', { bandId }),
-  bandSkip: () => act('g.bandSkip'),
+  band: (bandId, opts = {}) => act('g.band', { bandId, ...draftRequestScope(opts) }),
+  bandSkip: (opts = {}) => act('g.bandSkip', draftRequestScope(opts)),
   buy: (slot) => act('g.buy', { slot }),
   refresh: () => act('g.refresh'),
   freeze: () => act('g.freeze'),
@@ -67,12 +81,13 @@ export const actions = {
   art: (itemUid, row, col, dir) => act('g.art', dir ? { itemUid, row, col, dir } : { itemUid, row, col }),
   destroy: (uid) => act('g.destroy', { uid }),
   reward: (idx) => act('g.reward', { idx }),
-  choice: (idx, choiceId) => act('g.choice', choiceId === undefined ? { idx } : { idx, choiceId }),
+  choice: (idx, opts = {}) => act('g.choice', { idx, ...choiceRequestScope(opts) }),
   ready: (ready) => act('g.ready', { ready }, { sfx: ready ? 'ready' : 'back' }),
   emote: (id) => act('g.emote', { id }, { quiet: true }),
   // `playerId`: the player tapped in the team panel (a shared field shows two) — what an eliminated viewer follows
   watch: (fieldId, playerId = null) => act('g.watch', typeof playerId === 'string' && playerId ? { fieldId, playerId } : { fieldId }, { sfx: 'tab' }),
   autoplay: (on) => act('g.autoplay', { on }),
+  uniteSkipVote: ({ voteId } = {}) => act('g.uniteSkipVote', voteId == null ? {} : { voteId }, { sfx: 'confirm' }),
   // solo battles only (ui/matchStatus.js pauseAvailable): m.public.paused follows
   pause: (on) => act('g.pause', { on: !!on }, { sfx: on ? 'click' : 'confirm' }),
   // room-level intent (NOT g.*): the host frees a spectator seat while the match runs — the server takes room.removeSpectator at

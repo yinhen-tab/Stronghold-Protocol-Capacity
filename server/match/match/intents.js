@@ -20,10 +20,10 @@ export class MatchIntents {
         if (!ps.infoReady) { ps.infoReady = true; this.markPublic(); this.maybeEndInfo(); }
         return OK;
       case 'g.rerollVote': return this.voteSetupReroll(ps, msg.voteId, msg.agree);
-      case 'g.band': return this.pickBand(ps, msg.bandId);
-      case 'g.bandSkip': return this.skipBand(ps);
+      case 'g.band': return this.pickBand(ps, msg.bandId, msg);
+      case 'g.bandSkip': return this.skipBand(ps, msg);
       // the strategy highlighted in the draft screen (what a timed-out turn takes, timeoutBand)
-      case 'g.bandFocus': return this.bandFocus(ps, msg.bandId ?? null);
+      case 'g.bandFocus': return this.bandFocus(ps, msg.bandId ?? null, msg);
       case 'g.buy': return ps.buy(msg.slot);
       case 'g.refresh': return ps.refresh();
       case 'g.freeze': return ps.freeze();
@@ -37,18 +37,20 @@ export class MatchIntents {
       case 'g.reward': return ps.pickReward(msg.idx);
       case 'g.choice': return msg.choiceId !== undefined
         ? this.pickPersonalChoice(ps, msg.idx, msg.choiceId)
-        : this.pickCard(ps, msg.idx);
+        : this.pickCard(ps, msg.idx, msg);
       case 'g.ready': return ps.setReady(!!msg.ready);
       case 'g.emote': return this.emote(ps, msg.id);
       // playerId: the player tapped (a shared field names two) — the watch preference (item 56)
       case 'g.watch': return this.watch(ps, msg.fieldId, msg.playerId ?? null);
       case 'g.autoplay': return this.setAutoplay(ps, !!msg.on);
       case 'g.pause': return this.setPause(ps, !!msg.on);
+      case 'g.uniteSkipVote': return this.voteSkipUnite(ps, msg);
       // the stats the board's units start their next battle with (the detail card in prep, user playtest #4 item 7)
       case 'g.unitStats': return this.unitStats(ps, msg.seq ?? null);
       case 'g.leave': this.onLeave(ps.playerId); return OK;
       case 'b.progress': return this._onProgress(ps, msg);
       case 'b.result': return this._onResult(ps, msg);
+      case 'b.yield': return this._onYield(ps, msg);
       default: return fail(ERR.BAD_MSG);
     }
   }
@@ -67,6 +69,8 @@ export class MatchIntents {
   setAutoplay(ps, on) {
     if (ps.autoplay === on) return OK;
     ps.autoplay = on;
+    this.refreshDraftPriority(ps.playerId);
+    this.refreshUniteSkipVote();
     this.markPublic();
     if (on) this.kickBot(ps);
     return OK;
@@ -76,8 +80,8 @@ export class MatchIntents {
   kickBot(ps) {
     if (!ps.botControlled || this.ended) return;
     if (this.phase === PHASE.INFO_CHECK && !ps.infoReady) { ps.infoReady = true; this.markPublic(); this.maybeEndInfo(); }
-    else if (this.phase === PHASE.BAND_DRAFT && this.draftTurn() === ps.playerId) this.scheduleBandBot();
-    else if (this.phase === PHASE.SP_DRAFT && this.spTurn() === ps.playerId) this.scheduleSpBot();
+    else if (this.phase === PHASE.BAND_DRAFT && this.draftTurn(ps.playerId) === ps.playerId) this.scheduleBandBot(this.draftGroup(ps.playerId));
+    else if (this.phase === PHASE.SP_DRAFT && this.spTurn(ps.playerId) === ps.playerId) this.scheduleSpBot(this.spGroup(ps.playerId));
     else if (this.phase === PHASE.PREP && ps.alive && !ps.ready) this.scheduleBotPrep(ps, 0);
   }
 

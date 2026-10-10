@@ -36,6 +36,7 @@ export const MIME = Object.freeze({
   '.gif': 'image/gif',
   '.webp': 'image/webp',
   '.avif': 'image/avif',
+  '.bmp': 'image/bmp',
   '.svg': 'image/svg+xml; charset=utf-8',
   '.ico': 'image/x-icon',
   '.mp3': 'audio/mpeg',

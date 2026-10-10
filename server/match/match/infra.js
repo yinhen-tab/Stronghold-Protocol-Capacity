@@ -69,9 +69,11 @@ export class MatchInfra {
 
   alivePlayers() { return this.order.filter((p) => p.alive); }
 
+  poolFor(player) { return this.playerPools.get(typeof player === 'string' ? player : player?.playerId) || this.pool; }
+
   /** Whether any chess of a bond is in this match's pool (a 驰援 card of a fully banned bond is never offered). */
-  bondInPool(bondId) {
-    for (const id of this.pool.entries.keys()) {
+  bondInPool(bondId, player = null) {
+    for (const id of this.poolFor(player).entries.keys()) {
       const c = this.gd.chess(id);
       if (c && Array.isArray(c.bonds) && c.bonds.includes(bondId)) return true;
     }
@@ -83,8 +85,8 @@ export class MatchInfra {
    * 奥术 … never activate, research 02 §2.1) and still with chess in the pool. 机变 tactic cards whose every target bond
    * is dead are not offered (choices.js).
    */
-  bondLive(bondId) {
-    return !this.gd.modeInactiveBonds.has(bondId) && this.bondInPool(bondId);
+  bondLive(bondId, player = null) {
+    return !this.gd.modeInactiveBonds.has(bondId) && this.bondInPool(bondId, player);
   }
   humans() { return this.order.filter((p) => !p.isBot && !p.left); }
 
