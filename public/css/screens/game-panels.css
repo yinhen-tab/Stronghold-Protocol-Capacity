@@ -398,20 +398,20 @@ button.bpop__harmony:hover { border-style: solid; color: #fff; }
 .spov__groups { display: flex; flex: none; gap: .08rem; overflow-x: auto; padding: .02rem 0; scrollbar-width: thin; }
 .spov__group-tab { display: flex; flex: none; align-items: center; gap: .07rem; min-height: max(.38rem, 24px); padding: .04rem .12rem;
   color: var(--text-md); background: rgba(8, 13, 11, .75); border: 1px solid var(--pool-group-color); border: 1px solid color-mix(in srgb, var(--pool-group-color) 40%, transparent);
-  font-size: max(.14rem, 10px); }
+  font-size: max(calc(.14 * var(--t)), 10px); }
 .spov__group-tab > b { display: grid; place-items: center; width: max(.2rem, 13px); height: max(.2rem, 13px);
   color: #101719; background: var(--pool-group-color); font-family: var(--font-num); }
 .spov__group-tab .icon { width: max(.15rem, 10px); height: max(.15rem, 10px); color: var(--pool-group-color); }
 .spov__group-tab.is-active { border-color: var(--pool-group-color); background: #0b100e; background: color-mix(in srgb, var(--pool-group-color) 14%, #0b100e); color: var(--text-hi); }
 .spov__group-tab.is-own { font-weight: 700; }
-.spov__readonly { display: flex; align-items: center; gap: .12rem; flex: none; font-size: max(.14rem, 10px); color: var(--text-lo); }
+.spov__readonly { display: flex; align-items: center; gap: .12rem; flex: none; font-size: max(calc(.14 * var(--t)), 10px); color: var(--text-lo); }
 .spov__readonly button { border: 1px solid var(--mint-800); color: var(--mint-400); background: rgba(8, 13, 11, .75); padding: .02rem .1rem; font-size: inherit; }
 .spov__order { display: flex; gap: .1rem; overflow-x: auto; scrollbar-width: thin; }
 .spov__order--many { flex-wrap: wrap; max-height: 1rem; overflow-y: auto; overflow-x: hidden; gap: .04rem; }
 .spov__order--many .spov__who { padding: .02rem .04rem; gap: .02rem; }
 .spov__order--many .spov__who .pavatar { --pa: .34rem; }
 .spov__order--many .spov__wname { display: none; }
-.spov__order--many .spov__idx { font-size: .13rem; }
+.spov__order--many .spov__idx { font-size: calc(.13 * var(--t)); }
 .spov__order--many .spov__wstate .icon { width: .15rem; height: .15rem; }
 .spov__who { display: flex; align-items: center; gap: .08rem; padding: .05rem .12rem .05rem .06rem; background: rgba(255, 255, 255, .03); border: 1px solid var(--line); }
 .spov__who.is-cur { border-color: var(--gold); background: rgba(255, 198, 0, .08); }

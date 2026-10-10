@@ -71,7 +71,7 @@
 .gtop__right .countdown { --cd-h: .7rem; filter: drop-shadow(0 0 .12rem rgba(0, 0, 0, .8)); }
 .gtop__clock { display: flex; align-items: flex-start; gap: .14rem; }
 .unite-vote { display: flex; flex-direction: column; align-items: flex-end; gap: .03rem; padding: .05rem; background: rgba(8, 13, 11, .9); border: 1px solid var(--mint-800); }
-.unite-vote__count { font-size: max(.11rem, 10px); color: var(--text-md); }
+.unite-vote__count { font-size: max(calc(.11 * var(--t)), 10px); color: var(--text-md); }
 
 /* solo pause / resume (ui/hud.js PauseButton, official battle pause: two bars on a dark square) */
 .pausebtn {
