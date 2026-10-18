@@ -522,6 +522,11 @@ const DIY_EXTRA_PROTOTYPES = Object.freeze({ 5: Object.freeze({ rarity: 4, exclu
  */
 const DIY_EXCLUDED_TEAMS = Object.freeze(['rainbow', 'action4', 'mujica', 'sees', 'laios']);
 /**
+ * Characters removed from the data entirely (owner's decision): neither pickable nor listed in `excluded`.
+ * 结城理 (char_4217_makoto, Persona 3 collab) is dropped instead of only excluded, so it appears nowhere.
+ */
+const DIY_DROPPED_CHARS = Object.freeze(['char_4217_makoto']);
+/**
  * …and every 6★ of a 联动寻访, by the prefix of its character_table `displayNumber` (the collab series: MH Monster Hunter —
  * 麒麟R夜刀 MH02, 焰狐龙梓兰 MH05, whose team reserve6 names no collab —, RS Rainbow Six, AM Ave Mujica, PS Persona, DD
  * Dungeon Meshi); every other prefix in the pool is a faction (LM, NM, RE, RL, …).
@@ -614,7 +619,7 @@ function buildBackups(ctx, chess) {
   const legal6 = Object.keys(charTable).filter((id) => {
     const ch = charTable[id];
     return id.startsWith('char_') && requirements.has(ch.rarity) && ch.profession !== 'TOKEN' && ch.profession !== 'TRAP'
-      && !ch.isNotObtainable && !roster.has(id);
+      && !ch.isNotObtainable && !roster.has(id) && !DIY_DROPPED_CHARS.includes(id);
   }).sort(naturalCmp);
   const collabNumber = (ch) => DIY_EXCLUDED_NUMBER_PREFIXES.some((p) => new RegExp(`^${p}\\d`).test(ch.displayNumber || ''));
   const excluded = legal6.filter((id) => teamsOf(charTable[id]).some((t) => excludedTeams.has(t)) || collabNumber(charTable[id]));

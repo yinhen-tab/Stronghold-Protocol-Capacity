@@ -23,7 +23,7 @@ import { ROOT } from '../../server/data.js';
 import { schemaValidator } from '../helpers/jsonSchema.js';
 
 test('official effect format and optional expansion preserve legacy records', () => {
-  for (const fx of [{ unit: 'char_112_siege', skills: { 0: 'skchr_siege_3' } }, { unit: 'char_4217_makoto' }]) assert.deepEqual(operatorFxProblems(fx), []);
+  for (const fx of [{ unit: 'char_112_siege', skills: { 0: 'skchr_siege_3' } }, { unit: 'char_112_siege' }]) assert.deepEqual(operatorFxProblems(fx), []);
   for (const fx of [{}, { unit: '../x' }, { unit: 'x', skills: [] }, { unit: 'x', skills: { 0: 'https://bad' } }, { unit: 'x', script: 'x' }]) assert.ok(operatorFxProblems(fx).length);
   const r = guard(), base = getData(), opts = { pluginId: 'data-demo' };
   const old = expandFxRecords(base, [r], opts);
