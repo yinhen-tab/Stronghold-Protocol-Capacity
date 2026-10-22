@@ -4,8 +4,9 @@
 // Rules (the choices where DESIGN is silent are marked ▸):
 //   * Rooms are keyed by 4-letter codes from an unambiguous alphabet (no I/O, letters only). Join codes are
 //     case-insensitive.
-//   * 'solo' rooms hold exactly one human and never bots. 'coop' rooms have 4 seats (humans + AI bots).
-//     Humans and bots take the lowest free seat index; seat indexes never compact.
+//   * 'solo' rooms hold exactly one human and never bots. 'coop' rooms offer 4 / 8 / 10 / 16 / 20 seats (humans + AI bots).
+//     Humans and bots take the lowest free seat index. In a waiting room the host occupies seat 0;
+//     host transfer/migration swaps only the host and seat 0. Running matches retain their fixed seats.
 //   * ▸ Being in a LOBBY room and sending room.create / room.join implicitly leaves it. While your room is
 //     in a match, create/join of another room fails with ROOM_STARTED (send g.leave or room.leave first).
 //   * Host-only: room.setDifficulty, room.setAiPicksLast, room.addBot, room.removeBot, room.kick, room.start.
@@ -26,9 +27,8 @@
 //     Disconnect in a match: the seat is kept and match.onDisconnect(playerId) is called.
 //   * Reconnect: `hello` with a known token (reconnect window, 10 min, see net.js) rebinds the session;
 //     the lobby then broadcasts room.state and, in a match, calls match.onReconnect(playerId).
-//     Solo runs (下半: "休整期及机变阶段没有时间限制…24小时内随时返回", research 01 §1 / 06 §17): a session that drops
-//     while its solo room's match runs stays resumable for the official `config.constants.singleReconnectTime`
-//     (86400 s; option `soloReconnectWindowMs` overrides it) instead of the 10-minute window — the untimed solo match
+//     Solo runs: a session that drops while its solo room's match runs stays resumable for 2 h by default
+//     (option `soloReconnectWindowMs` overrides it), instead of the 10-minute window — the untimed solo match
 //     simply waits (net.js session.resumeWindowMs, set at every disconnect). Only after that does expiry turn into
 //     match.onLeave ('abandoned'). The extension outlives the match, so a run that ended meanwhile (e.g. a server-run
 //     Final Assault) still shows its result on the player's return.
@@ -150,7 +150,7 @@
 //     ends with summary.reason 'plugin-crash' | 'plugin-hang' | 'plugin-start' and the room is back in its lobby.
 //   * Spectator seats (community report #26, owner's decision 2026-10-04 — a remake feature, the official room has none):
 //     room.spectate { code } takes one of a co-op room's MAX_SPECTATORS (2) spectator seats, in its lobby or while its
-//     match runs (▸ solo rooms: ROOM_FULL). A spectator is not a player: never in `seats`, never counted for the 1–4 players
+//     match runs (▸ solo rooms: ROOM_FULL). A spectator is not a player: never in `seats`, never counted for the 1–20 players
 //     or the start gate, never host, never keeps a room alive (a room whose last human leaves closes with room.closed
 //     {empty} for its spectators). It receives room.state (`spectators: [{ playerId, name, connected }]`) and every match
 //     broadcast (m.public, m.ticker, m.emote, b.pool — public data); the match registers it (opts.spectators /
@@ -161,13 +161,16 @@
 //     code; a player never switches to spectating in place (ALREADY). Disconnect / grace / reconnect / expiry work as for
 //     a player seat (the seat is kept and given back on resume).
 
-import { randomBytes, randomInt } from 'node:crypto';
-import { DIFFICULTIES, ERR, MAX_SEATS, MAX_SPECTATORS, ROOM_CODE_LEN, modeIdFor } from '../shared/constants.js';
+import { randomBytes, randomInt, randomUUID } from 'node:crypto';
+import { DIFFICULTIES, ERR, PHASE, DEFAULT_SEATS, ROOM_CAPACITIES, MAX_SEATS, MAX_SPECTATORS, ROOM_CODE_LEN, modeIdFor } from '../shared/constants.js';
 import { checkLoadout, checkLoadoutOps, cultivationCharIds, checkNotOwned, checkDiyPicks, charPotentialChanges, checkSkinSelection, operatorCharIds } from '../shared/protocol.js';
-import { encode, isDroppable, isErrCode, sendRaw, sendSession } from './net.js';
+import { encode, prepareMessage, sendPrepared, isDroppable, isErrCode, sendRaw, sendSession } from './net.js';
 import { getData as defaultGetData, lookup } from './data.js';
 import { Match as DefaultMatch } from './match/Match.js';
 import { KITTED_CHARS } from './sim/content/kits/index.js';
+import { LobbyDiscovery } from './lobbyDiscovery.js';
+import { assetCacheReadinessMatches } from '../shared/assetCache.js';
+import { MatchChat } from './matchChat.js';
 
 const VANILLA_KITTED = new Set(KITTED_CHARS);
 import { isContentHash } from '../shared/plugins/identity.js';
@@ -185,7 +188,7 @@ export const LOBBY_DEFAULTS = Object.freeze({
   maxRoomsPerAddr: 16,    // rooms created from one client network that may exist at once (0 = unlimited)
   maxMatchesPerAddr: 8,   // matches started from one client network that may run at once (0 = unlimited)
   resyncMinGapMs: 1000,   // heavy resyncs (match state / result replay) per session at most this often on repeated hellos
-  soloReconnectWindowMs: null, // a dropped solo run stays resumable this long (null = data singleReconnectTime, 24 h)
+  soloReconnectWindowMs: 2 * 60 * 60_000, // branch policy: 2 h; explicit null retains the official data fallback
 });
 
 /** Official `singleReconnectTime` (s) when the data lacks it (constData, research 01 §1). */
@@ -250,8 +253,8 @@ function freezeDiy(picks) {
  * Frozen copy of a skin selection (docs/SKINS.md), keyed by operator charId.
  *
  * A non-plain object, a key that is not a charId, a value that is not a skinId, or a map over the wire cap is refused
- * (`null` — the caller answers BAD_MSG and does not clear what is already stored). A charId `hasOperator` rejects is
- * dropped. The stored copy is then at most the operator count of the room's content, and ≤ 256 [ASSUMED].
+ * (null — the caller answers BAD_MSG and does not clear what is already stored). A charId `hasOperator` rejects is
+ * dropped. The stored copy is then at most the operator count of the room's content, and <= 256 [ASSUMED].
  * @param {Record<string, string>} skins `{ [charId]: skinId }`
  * @param {(charId: string) => boolean} hasOperator
  * @returns {Readonly<Record<string, string>>|null}
@@ -262,27 +265,33 @@ function freezeSkins(skins, hasOperator) {
   return Object.freeze({ ...res.skins });
 }
 
-/** One room: 4 seat slots, host, difficulty, optional running match. */
+/** One room: configurable player seats (4/8/10/16/20), host, difficulty, optional running match. */
 export class Room {
   /** @param {string} code @param {'solo'|'coop'} mode @param {string} difficulty @param {number} now */
-  constructor(code, mode, difficulty, now) {
+  constructor(code, mode, difficulty, now, capacity = DEFAULT_SEATS) {
     this.code = code;
+    // Public directory identity is independent of the invitation code and lasts only for this room's lifetime.
+    this.directoryId = randomUUID();
+    this.allowMatchmaking = true;
     this.mode = mode;
     this.difficulty = difficulty;
     /**
-     * 「AI 队友最后选择」 (room.setAiPicksLast, GitHub #338; co-op only, off by default): the match's strategy and 机变 drafts
-     * put every human seat before every AI seat (Match opts.aiPicksLast). Kept across the room's matches.
+     * Compatibility with upstream's option (GitHub #338). This capacity branch always orders manual, connected
+     * humans first inside each draft group (D004/D012); disconnected/autoplay humans share the automatic category.
      */
-    this.aiPicksLast = false;
+    this.aiPicksLast = mode !== 'solo';
     /** @type {string | null} */
     this.hostId = null;
+    /** @type {number | null} Server policy; null leaves AI seats bounded only by room capacity. */
+    this.maxAiPerRoom = null;
     /** @type {(Seat | null)[]} */
-    this.seats = new Array(MAX_SEATS).fill(null);
+    this.capacity = mode === 'solo' ? 1 : capacity;
+    this.seats = new Array(this.capacity).fill(null);
     /** @type {{ playerId: string, name: string, connected: boolean }[]} spectator seats, ≤ MAX_SPECTATORS (header) */
     this.spectators = [];
     /** @type {any} running Match instance */
     this.match = null;
-    /** @type {{ live: boolean, ended: boolean, disposed: boolean, match: any } | null} */
+    /** @type {{ live: boolean, ended: boolean, disposed: boolean, match: any, chat: MatchChat } | null} */
     this.matchCtx = null;
     this.matchCount = 0;
     /** @type {any} summary passed to onEnd by the last match */
@@ -340,10 +349,16 @@ export class Room {
       t: 'room.state',
       code: this.code,
       hostId: this.hostId,
+      maxAiPerRoom: this.maxAiPerRoom,
       mode: this.mode,
       difficulty: this.difficulty,
+      capacity: this.capacity,
       aiPicksLast: this.aiPicksLast,
+      allowMatchmaking: this.allowMatchmaking,
       inMatch: !!this.match,
+      // v1 extension metadata only: message bodies never ride room/public snapshots or result replay.
+      chatMatchId: this.match && this.matchCtx?.live && !this.matchCtx.ended && !this.matchCtx.chat.closed
+        ? this.matchCtx.chat.matchId : null,
       seats: this.seats.map((s) => (s
         ? { seat: s.seat, playerId: s.playerId, name: s.name, isBot: s.isBot, ready: s.ready, connected: s.connected && !s.left,
           // a room with gameplay plugins (header "Gameplay plugins"): has this player's page loaded and checked its content?
@@ -412,8 +427,14 @@ export class Lobby {
     this.testEnabled = false;
     this.testWarn = this.testUnrecognized;
     if (testHostOpt != null) this.setTestHost(testHostOpt);
+    /** @type {number | null} Owner-controlled AI ceiling, independent from the distributed bundle defaults. */
+    this.maxAiPerRoom = null;
+    this.requireAssetCache = false;
+    this.emergency = { active: false };
+    this.getAssetCacheSummary = () => null;
     /** @type {Map<string, Room>} */
     this.rooms = new Map();
+    this.discovery = new LobbyDiscovery(this);
     /** @type {Map<string, NodeJS.Timeout>} lobby grace timers by playerId */
     this.graceTimers = new Map();
     /** @type {Map<string, NodeJS.Timeout>} deferred (coalesced) resyncs by playerId */
@@ -509,6 +530,58 @@ export class Lobby {
   /** @param {string} code @returns {Room | null} */
   getRoom(code) { return this.rooms.get(String(code).toUpperCase()) || null; }
 
+  /** Update the owner policy atomically; active matches keep their roster until their next waiting room. */
+  setAiLimit(limit) {
+    if (limit !== null && (!Number.isInteger(limit) || limit < 0 || limit >= MAX_SEATS)) {
+      throw new RangeError(`AI limit must be null or an integer from 0 to ${MAX_SEATS - 1}`);
+    }
+    if (this.maxAiPerRoom === limit) return;
+    this.maxAiPerRoom = limit;
+    for (const room of this.rooms.values()) {
+      room.maxAiPerRoom = limit;
+      if (!room.match) this.trimBots(room);
+      this.broadcastState(room);
+    }
+  }
+
+  /** Owner policy affects new membership only. Network/Lobby dispatch stays entirely synchronous. */
+  setAssetCachePolicy({ required, getSummary = this.getAssetCacheSummary }) {
+    if (typeof required !== 'boolean' || typeof getSummary !== 'function') throw new TypeError('invalid asset-cache policy');
+    this.getAssetCacheSummary = getSummary;
+    if (this.requireAssetCache === required) return;
+    this.requireAssetCache = required;
+    this.discovery.changed();
+  }
+
+  assetCacheAdmission(report) {
+    if (!this.requireAssetCache) return null;
+    const expected = this.getAssetCacheSummary();
+    if (assetCacheReadinessMatches(report, expected)) return null;
+    return fail(ERR.ASSET_CACHE_REQUIRED, !expected ? 'server-assets-pending'
+      : !expected.complete || expected.missingFiles ? 'server-assets-incomplete' : 'precache-missing');
+  }
+
+  /** Runtime bandwidth protection is independent from persistent owner settings. */
+  setEmergency(state) {
+    this.emergency = { active: !!state.active, reason: state.reason || 'bandwidth',
+      since: state.startedAt || state.since || this.now(), retryAt: state.retryAt || 0 };
+    for (const room of this.rooms.values()) if (room.match) {
+      this.callMatch(room, 'setEmergencyFreeze', this.emergency.active, this.emergency);
+    }
+    this.discovery.changed();
+  }
+
+  allowEmergencyResume(session) { return !!this.roomOf(session)?.match; }
+
+  /** Preserve the earliest AI seats and every human; remove only surplus trailing AI seats. */
+  trimBots(room) {
+    if (room.match || this.maxAiPerRoom === null) return;
+    let surplus = room.seats.filter((s) => s?.isBot).length - this.maxAiPerRoom;
+    for (let i = room.seats.length - 1; i >= 0 && surplus > 0; i--) {
+      if (room.seats[i]?.isBot) { room.seats[i] = null; surplus--; }
+    }
+  }
+
   /** Counters for /healthz. */
   stats() {
     let matches = 0;
@@ -533,6 +606,8 @@ export class Lobby {
    * @param {{ resumed: boolean, repeat: boolean }} info
    */
   onHello(session, { resumed, repeat }) {
+    if (resumed) this.discovery.forget(session.playerId);
+    this.discovery.changed();
     if (!resumed && !repeat) return;
     const room = this.roomOf(session);
     if (!room) {
@@ -571,6 +646,11 @@ export class Lobby {
    * @returns {{ ok: true } | { error: string, detail?: string } | Promise<{ ok: true } | { error: string, detail?: string }>}
    */
   onMessage(session, msg) {
+    // 带宽熔断 (server/bandwidthEmergency.js): while the host throttles downloads these actions are refused; a running
+    // match and its reconnects are untouched (the match freezes its own clocks instead).
+    if (this.emergency.active && (['lobby.quickMatch', 'room.create', 'room.start', 'room.rerollSetup',
+      'room.cancelReroll', 'room.loadout', 'room.ownership', 'room.diy', 'room.chat'].includes(msg.t)
+      || (msg.t === 'lobby.watch' && msg.on))) return fail(ERR.SERVER_EMERGENCY);
     const room = this.queuedRoom(session);
     if (!room) return this.handleMessage(session, msg);
     // a queued room.contentReady speaks for the page that sent it: the seat and its generation now — a disconnect in
@@ -635,15 +715,22 @@ export class Lobby {
    */
   handleMessage(session, msg, ctx = null) {
     switch (msg.t) {
+      case 'lobby.watch': return this.discovery.watch(session, msg);
+      case 'lobby.quickMatch': return this.discovery.quickMatch(session, msg);
+      case 'lobby.join': return this.discovery.accessById(session, msg, false);
+      case 'lobby.spectate': return this.discovery.accessById(session, msg, true);
       case 'room.create': return this.create(session, msg);
       case 'room.join': return this.join(session, msg);
       case 'room.leave': return this.leave(session);
       case 'room.ready': return this.ready(session, msg);
       case 'room.setDifficulty': return this.setDifficulty(session, msg);
+      case 'room.setCapacity': return this.setCapacity(session, msg);
+      case 'room.setMatchmaking': return this.setMatchmaking(session, msg);
       case 'room.setAiPicksLast': return this.setAiPicksLast(session, msg);
       case 'room.addBot': return this.addBot(session);
       case 'room.removeBot': return this.removeBot(session, msg);
       case 'room.kick': return this.kick(session, msg);
+      case 'room.transferHost': return this.transferHost(session, msg);
       case 'room.start': return this.start(session);
       case 'room.rerollSetup': return this.rerollSetup(session, msg);
       case 'room.cancelReroll': return this.rerollSetup(session, msg, true);
@@ -657,6 +744,7 @@ export class Lobby {
       case 'room.setMode': return this.setMode(session, msg);
       case 'room.contentReady': return this.contentReady(session, msg, ctx);
       case 'room.consent': return this.consent(session,msg);
+      case 'room.chat': return this.chat(session, msg);
       default:
         if (typeof msg.t === 'string' && msg.t.startsWith('g.')) return this.routeGameNow(session, msg);
         return fail(ERR.BAD_MSG, `unhandled type ${String(msg.t).slice(0, 32)}`);
@@ -665,9 +753,11 @@ export class Lobby {
 
   /** The session's socket closed. @param {import('./net.js').Session} session */
   onDisconnect(session) {
+    this.discovery.forget(session.playerId);
+    this.discovery.changed();
     this.clearResync(session.playerId); // the next resume resyncs immediately
     const room = this.roomOf(session);
-    // a solo run may be resumed within singleReconnectTime (24 h); everything else keeps the registry's window
+    // a solo run may be resumed within the configured window (default 2 h); everything else keeps the registry's window
     session.resumeWindowMs = room && room.match && room.mode === 'solo' ? this.soloResumeWindowMs() : null;
     if (!room) return;
     const player = room.seatOf(session.playerId);
@@ -691,6 +781,7 @@ export class Lobby {
 
   /** The session's reconnect window elapsed (already removed from the registry). */
   onExpire(session) {
+    this.discovery.forget(session.playerId);
     session.notice = null;
     session.pendingResult = null;
     this.clearResync(session.playerId);
@@ -714,6 +805,7 @@ export class Lobby {
     this.offContentStale?.();
     this.offStale = null;
     this.offContentStale = null;
+    this.discovery.close();
     for (const room of [...this.rooms.values()]) this.disposeRoom(room, reason);
     for (const t of this.graceTimers.values()) clearTimeout(t);
     this.graceTimers.clear();
@@ -725,11 +817,15 @@ export class Lobby {
   // room.* handlers
   // ---------------------------------------------------------------------------------------------------
 
-  create(session, { mode, difficulty, test } = {}) {
+  create(session, { mode, difficulty, test, capacity = DEFAULT_SEATS, assetCache } = {}) {
     // A test room exists only when the process switch allowed it. The check runs before the room is built.
     if (test === true && this.testEnabled !== true) return fail(ERR.TEST_DISABLED);
+    if (this.emergency.active) return fail(ERR.SERVER_EMERGENCY);
+    if (!ROOM_CAPACITIES.includes(capacity)) return fail(ERR.BAD_MSG, 'invalid capacity');
     const cur = this.roomOf(session);
     if (cur && cur.match) return fail(ERR.ROOM_STARTED, 'leave your running match first');
+    const admission = this.assetCacheAdmission(assetCache);
+    if (admission) return admission;
     if (this.rooms.size >= this.opts.maxRooms) return fail(ERR.INTERNAL, 'too many rooms');
     const key = session.limitKey || null;
     if (key && this.opts.maxRoomsPerAddr > 0) {
@@ -743,8 +839,9 @@ export class Lobby {
     const code = this.genCode();
     if (!code) return fail(ERR.INTERNAL, 'no room code available');
     if (cur) this.removeMember(cur, session.playerId);
-    const room = new Room(code, mode, difficulty, this.now());
+    const room = new Room(code, mode, difficulty, this.now(), capacity);
     room.test = test === true;
+    room.maxAiPerRoom = this.maxAiPerRoom;
     room.content = this.vanilla;
     // the server owner's default plugins (plugins/config.json `default`; header "Gameplay plugins"): none — the original game
     const defaults = this.plugins?.defaults?.() || [];
@@ -758,6 +855,7 @@ export class Lobby {
     room.hostId = session.playerId;
     this.rooms.set(code, room);
     session.roomCode = code;
+    this.discovery.forget(session.playerId);
     session.notice = null;
     session.pendingResult = null;
     this.log.info(`[lobby] ${code} created (${mode}/${difficulty}${room.test ? ', test' : ''}) by ${session.name}`);
@@ -765,22 +863,26 @@ export class Lobby {
     return OK;
   }
 
-  join(session, { code, testAck }) {
+  join(session, { code, testAck, assetCache }) {
     const norm = String(code).trim().toUpperCase();
     const room = norm.length === ROOM_CODE_LEN ? this.rooms.get(norm) : undefined;
     if (!room) return fail(ERR.ROOM_NOT_FOUND);
     if (room.test && testAck !== true) return fail(ERR.TEST_CONFIRM);
     const cur = this.roomOf(session);
     // idempotent for members; a spectator of this room goes on below: it may take a free player seat (header)
-    if (cur === room && !room.spectatorOf(session.playerId)) { this.sendState(room, session); return OK; }
+    if (cur === room && !room.spectatorOf(session.playerId)) { this.discovery.forget(session.playerId); this.sendState(room, session); return OK; }
+    if (this.emergency.active) return fail(ERR.SERVER_EMERGENCY);
     if (cur && cur.match) return fail(ERR.ROOM_STARTED, 'leave your running match first');
     if (room.match) return fail(ERR.ROOM_STARTED);
+    const admission = this.assetCacheAdmission(assetCache);
+    if (admission) return admission;
     if (room.mode === 'solo') return fail(ERR.ROOM_FULL, 'solo room');
     const idx = room.freeSeat();
     if (idx < 0) return fail(ERR.ROOM_FULL);
     if (cur) this.removeMember(cur, session.playerId);
     room.seats[idx] = this.humanSeat(idx, session);
     session.roomCode = room.code;
+    this.discovery.forget(session.playerId);
     session.notice = null;
     session.pendingResult = null;
     if (!room.hostId) room.hostId = session.playerId;
@@ -799,7 +901,7 @@ export class Lobby {
    * room.spectate: one of a co-op room's MAX_SPECTATORS spectator seats, in its lobby or during its match (header). In a
    * running match the match registers the spectator and resends what it may see (Match.addSpectator).
    */
-  spectate(session, { code, testAck }) {
+  spectate(session, { code, testAck, assetCache }) {
     const norm = String(code).trim().toUpperCase();
     const room = norm.length === ROOM_CODE_LEN ? this.rooms.get(norm) : undefined;
     if (!room) return fail(ERR.ROOM_NOT_FOUND);
@@ -807,19 +909,27 @@ export class Lobby {
     const cur = this.roomOf(session);
     if (cur === room) {
       if (!room.spectatorOf(session.playerId)) return fail(ERR.ALREADY, 'seated as a player');
+      this.discovery.forget(session.playerId);
       this.sendState(room, session);
       return OK;
     }
+    if (this.emergency.active) return fail(ERR.SERVER_EMERGENCY);
     if (cur && cur.match) return fail(ERR.ROOM_STARTED, 'leave your running match first');
+    const admission = this.assetCacheAdmission(assetCache);
+    if (admission) return admission;
     if (room.mode === 'solo') return fail(ERR.ROOM_FULL, 'solo room');
     if (room.spectators.length >= MAX_SPECTATORS) return fail(ERR.ROOM_FULL, 'no free spectator seat');
     if (cur) this.removeMember(cur, session.playerId);
     room.spectators.push({ playerId: session.playerId, name: session.name, connected: session.connected });
     session.roomCode = room.code;
+    this.discovery.forget(session.playerId);
     session.notice = null;
     session.pendingResult = null;
     this.broadcastState(room);
-    if (room.match) this.callMatch(room, 'addSpectator', session.playerId);
+    if (room.match) {
+      this.callMatch(room, 'addSpectator', session.playerId);
+      this.sendChatState(room, session.playerId);
+    }
     return OK;
   }
 
@@ -857,6 +967,38 @@ export class Lobby {
     return OK;
   }
 
+  /** Resize only empty trailing seats; retain readiness and never move or eject a human or an AI. */
+  setCapacity(session, { capacity }) {
+    const room = this.roomOf(session);
+    if (!room) return fail(ERR.NOT_IN_ROOM);
+    if (room.hostId !== session.playerId) return fail(ERR.NOT_HOST);
+    if (room.match) return fail(ERR.ROOM_STARTED);
+    if (room.mode === 'solo' || !ROOM_CAPACITIES.includes(capacity)) return fail(ERR.BAD_MSG, 'invalid capacity');
+    if (room.seats.some((s, i) => s && i >= capacity)) return fail(ERR.BAD_TARGET, 'occupied seat outside requested capacity');
+    if (room.capacity === capacity) return OK;
+    this.dropReplay(room, session.playerId);
+    if (capacity > room.capacity) room.seats.push(...new Array(capacity - room.capacity).fill(null));
+    else room.seats.length = capacity;
+    room.capacity = capacity;
+    this.broadcastState(room);
+    return OK;
+  }
+
+  /** Only a co-op waiting-room host controls public admission; invitations and observation stay available. */
+  setMatchmaking(session, { allowed }) {
+    const room = this.roomOf(session);
+    if (!room) return fail(ERR.NOT_IN_ROOM);
+    if (room.hostId !== session.playerId) return fail(ERR.NOT_HOST);
+    if (room.match) return fail(ERR.ROOM_STARTED);
+    if (room.mode !== 'coop') return fail(ERR.BAD_TARGET, 'solo rooms cannot be matched');
+    if (typeof allowed !== 'boolean') return fail(ERR.BAD_MSG, 'invalid matchmaking policy');
+    if (room.allowMatchmaking === allowed) return OK;
+    this.dropReplay(room, session.playerId);
+    room.allowMatchmaking = allowed;
+    this.broadcastState(room);
+    return OK;
+  }
+
   setDifficulty(session, { difficulty }) {
     const room = this.roomOf(session);
     if (!room) return fail(ERR.NOT_IN_ROOM);
@@ -873,19 +1015,15 @@ export class Lobby {
     return OK;
   }
 
-  /** 「AI 队友最后选择」 (GitHub #338): host-only, before the match, co-op rooms only (a solo room has no AI seat). */
+  /** Accept old clients enabling the rule, but never disable this branch's fixed manual-human-first ordering. */
   setAiPicksLast(session, { on }) {
     const room = this.roomOf(session);
     if (!room) return fail(ERR.NOT_IN_ROOM);
     if (room.hostId !== session.playerId) return fail(ERR.NOT_HOST);
     if (room.match) return fail(ERR.ROOM_STARTED);
     if (room.mode === 'solo') return fail(ERR.BAD_TARGET, 'solo rooms have no AI teammates');
+    if (!on) return fail(ERR.BAD_TARGET, 'manual players always pick first in this capacity branch');
     this.dropReplay(room, session.playerId);
-    if (room.aiPicksLast !== on) {
-      room.aiPicksLast = on;
-      for (const s of room.seats) if (s && !s.isBot && s.playerId !== room.hostId) s.ready = false;
-      this.broadcastState(room);
-    }
     return OK;
   }
 
@@ -1066,6 +1204,9 @@ export class Lobby {
     if (room.mode === 'solo') return fail(ERR.ROOM_FULL, 'solo rooms cannot have AI teammates');
     const idx = room.freeSeat();
     if (idx < 0) return fail(ERR.ROOM_FULL);
+    if (this.maxAiPerRoom !== null && room.seats.filter((s) => s?.isBot).length >= this.maxAiPerRoom) {
+      return fail(ERR.AI_LIMIT);
+    }
     const used = new Set(room.seats.filter((s) => s && s.isBot).map((s) => s.name));
     const name = BOT_NAMES.find((n) => !used.has(n)) || `AI·${idx + 1}`;
     let playerId;
@@ -1075,7 +1216,7 @@ export class Lobby {
     return OK;
   }
 
-  removeBot(session, { seat }) {
+  removeBot(session, { seat, playerId }) {
     const room = this.roomOf(session);
     if (!room) return fail(ERR.NOT_IN_ROOM);
     if (room.hostId !== session.playerId) return fail(ERR.NOT_HOST);
@@ -1083,8 +1224,29 @@ export class Lobby {
     this.dropReplay(room, session.playerId);
     const target = room.seats[seat];
     if (!target || !target.isBot) return fail(ERR.BAD_TARGET, 'seat does not hold an AI');
+    if (playerId !== undefined && target.playerId !== playerId) return fail(ERR.BAD_TARGET, 'seat changed hands');
     room.seats[seat] = null;
     this.broadcastState(room);
+    return OK;
+  }
+
+  /** Waiting-room handover to a connected human; identity is checked again after the confirmation dialog. */
+  transferHost(session, { playerId }) {
+    const room = this.roomOf(session);
+    if (!room) return fail(ERR.NOT_IN_ROOM);
+    if (room.hostId !== session.playerId) return fail(ERR.NOT_HOST);
+    if (room.match) return fail(ERR.ROOM_STARTED);
+    const target = room.seatOf(playerId);
+    const targetSession = this.registry.byId(playerId);
+    if (!target || target.isBot || target.left || !target.connected || target.playerId === session.playerId
+      || !targetSession?.connected || targetSession.roomCode !== room.code) {
+      return fail(ERR.BAD_TARGET, 'target must be another connected human in this room');
+    }
+    this.dropReplay(room, session.playerId);
+    room.hostId = playerId;
+    this.promoteHostSeat(room);
+    this.broadcastState(room);
+    this.log.info(`[lobby] ${room.code} host transferred to ${target.name}`);
     return OK;
   }
 
@@ -1113,6 +1275,7 @@ export class Lobby {
   }
 
   start(session) {
+    if (this.emergency.active) return fail(ERR.SERVER_EMERGENCY);
     const room = this.roomOf(session);
     if (!room) return fail(ERR.NOT_IN_ROOM);
     if (room.hostId !== session.playerId) return fail(ERR.NOT_HOST);
@@ -1125,6 +1288,7 @@ export class Lobby {
     // a room with gameplay plugins starts once every player's page has loaded and checked its content (the host's too)
     if (room.modded && humans.some((s) => s.content !== 'ready')) return fail(ERR.CONTENT_NOT_READY);
     const bots = room.seats.filter((s) => s && s.isBot);
+    if (this.maxAiPerRoom !== null && bots.length > this.maxAiPerRoom) return fail(ERR.AI_LIMIT);
     if (humans.length < 1 || (room.mode === 'solo' && (humans.length !== 1 || bots.length > 0))) {
       return fail(ERR.BAD_MSG, 'invalid seat configuration');
     }
@@ -1187,10 +1351,53 @@ export class Lobby {
     return matchAnswer(r);
   }
 
-  /**
-   * room.ownership (0.2.0 补位): keep the droppable chess of the not-owned list, store it on the session and the seat
-   * (see the header). A running match never takes it: it keeps the list its seat had at its start.
-   */
+  seatSettings(room, s, data) {
+    const cs = this.csOf(room);
+    const other = (checked) => !!cs && (checked ?? this.vanilla?.cs ?? null) !== cs;
+    let loadout = s.loadout || null;
+    let ops = s.ops || null;
+    let notOwned = s.notOwned || null;
+    let diy = s.diy || null;
+    const chess = (id) => lookup('chess', id, data);
+    if (loadout && other(s.loadoutCs)) {
+      const keep = {};
+      for (const [id, e] of Object.entries(loadout)) {
+        const r = checkLoadout({ [id]: { skill: e.skill, ...(e.module != null ? { module: e.module } : {}) } }, chess);
+        if (r && !r.error && r.loadout[id]) keep[id] = r.loadout[id];
+      }
+      loadout = freezeLoadout(keep);
+      const ids = opsCharIds(data);
+      const changes = (x) => charPotentialChanges(data, x);
+      const keepOps = {};
+      for (const [id, e] of Object.entries(ops || {})) {
+        // a 潜能 that changes nothing on this content's operator (a plugin's char_x_ without a curve) is dropped, its 练度
+        // kept — as the page's sanitizeOps does (public/js/ui/loadoutModel.js)
+        const one = changes(id) === false ? { cultivate: e.cultivate } : { potential: e.potential, cultivate: e.cultivate };
+        const r = checkLoadoutOps({ [id]: one }, (x) => ids.has(x), changes);
+        if (r && !r.error && r.ops[id]) keepOps[id] = r.ops[id];
+      }
+      ops = freezeOps(keepOps);
+    }
+    if (notOwned && other(s.notOwnedCs)) {
+      const r = checkNotOwned([...notOwned], chess);
+      notOwned = r && !r.error ? Object.freeze(r.notOwned.slice()) : null;
+    }
+    if (diy && other(s.diyCs)) {
+      const r = checkDiyPicks({ ...diy }, { data, kitted: this.kittedFor(room) });
+      diy = r && 'ok' in r ? freezeDiy(r.picks) : null;
+    }
+    // 干员皮肤 (docs/SKINS.md): the skinId lives in a cosmetic overlay, not the content set, but the KEY is an operator
+    // of this room. A charId the content does not have is dropped; a map that is no longer a plain charId→skinId
+    // selection is left off the seat rather than handed to the match.
+    let skins = null;
+    if (s.skins && typeof s.skins === 'object') {
+      const ids = operatorCharIds(data);
+      const res = checkSkinSelection(s.skins, (id) => ids.has(id));
+      if (res.ok) skins = Object.freeze({ ...res.skins });
+    }
+    return { loadout, ops, notOwned, diy, skins };
+  }
+
   ownership(session, { notOwned }) {
     const room = this.roomOf(session);
     const data = this.dataFor(room);
@@ -1207,11 +1414,6 @@ export class Lobby {
     return OK;
   }
 
-  /**
-   * room.diy (0.2.0 自选编队): keep the legal picks (checkDiyPicks against the data and KITTED_CHARS — the room's own in a
-   * room with gameplay plugins), store them on the session and the seat (see the header). A running match never takes
-   * them: it keeps the picks its seat had at its start.
-   */
   diy(session, { picks }) {
     const room = this.roomOf(session);
     const res = checkDiyPicks(picks, { data: this.dataFor(room), kitted: this.kittedFor(room) });
@@ -1227,14 +1429,6 @@ export class Lobby {
     return OK;
   }
 
-  /**
-   * room.skins (docs/SKINS.md): store the appearances this player chose for their operators, on the session and the
-   * seat, and hand them to a running match.
-   *
-   * Unlike room.loadout there is no phase gate. The loadout is frozen at INFO_CHECK because it changes what a unit
-   * *does*; a skin changes only what it looks like, and it is public — a teammate switching model mid-match is
-   * harmless, and the next `m.public` broadcast carries it to everyone.
-   */
   skins(session, { skins }) {
     const room = this.roomOf(session);
     const ids = operatorCharIds(this.dataFor(room));
@@ -1249,18 +1443,6 @@ export class Lobby {
     return matchAnswer(this.callMatch(room, 'setSkins', session.playerId, kept));
   }
 
-  /** The game data of a room's content (header "Gameplay plugins"): its content set's, else the server's. @param {Room | null} room */
-  dataFor(room) {
-    if (room?.modded) {
-      try {
-        const d = this.plugins?.dataOf?.(room.content.cs);
-        if (d) return d;
-      } catch (e) { this.log.error(`[lobby] ${room.code} content data failed`, e); }
-    }
-    return this.safeData();
-  }
-
-  /** The operators a 自选 slot may field in a room (its content set's list, else the vanilla one). @param {Room | null} room */
   kittedFor(room) {
     if (room?.modded) {
       try {
@@ -1271,7 +1453,6 @@ export class Lobby {
     return KITTED_CHARS;
   }
 
-  /** The content a setting stored now is checked for: the room's cs, else the server's vanilla one. @param {Room | null} room */
   csOf(room) { return room?.content?.cs ?? this.vanilla?.cs ?? null; }
 
   /**
@@ -1327,10 +1508,17 @@ export class Lobby {
     return { loadout, ops, notOwned, diy, skins };
   }
 
-  /**
-   * Extra fields of every `welcome` (net.js): the operators a 自选 slot may field (shared/diy.js `kitted`) and the
-   * server's content identity (header "Content identity").
-   */
+  dataFor(room) {
+    if (room?.modded) {
+      try {
+        const d = this.plugins?.dataOf?.(room.content.cs);
+        if (d) return d;
+      } catch (e) { this.log.error(`[lobby] ${room.code} content data failed`, e); }
+    }
+    return this.safeData();
+  }
+
+  /** Extra welcome fields: supported 自选 operators, the server's content identity and the precache policy. */
   welcomeInfo() {
     let info;
     if (!this.vanilla) info = { diyKitted: KITTED_CHARS };
@@ -1343,8 +1531,12 @@ export class Lobby {
     }
     // Omitted when the switch is off, so a welcome from a normal server stays identical.
     if (this.testEnabled === true) info.testMode = true;
+    // 服主运维层 (tools/server-settings.mjs): 素材预缓存要求与带宽熔断标志
+    info.requireAssetCache = this.requireAssetCache;
+    info.emergency = this.emergency;
     return info;
   }
+
 
   // ---------------------------------------------------------------------------------------------------
   // Match wiring
@@ -1374,7 +1566,8 @@ export class Lobby {
       };
     });
     // lastPublic / results: the latest m.public broadcast and the m.result frames (encoded), kept for the replay.
-    const ctx = { live: true, ended: false, disposed: false, match: null, lastPublic: null, sharedResult: null, results: new Map() };
+    const ctx = { live: true, ended: false, disposed: false, match: null, lastPublic: null, sharedResult: null,
+      results: new Map(), chat: new MatchChat({ now: this.now }) };
     let seed = 0;
     try { seed = this.seedFn() >>> 0; } catch { seed = randomInt(2 ** 32); }
     const modded = room.modded;
@@ -1425,6 +1618,7 @@ export class Lobby {
       this.log.info(`[lobby] ${room.code} match #${room.matchCount} starting (${room.mode}/${room.difficulty}, ${seats.length} seats, seed ${seed}${room.test ? ', test' : ''}${modded ? `, content ${room.content.cs.slice(0, 8)}${match.hosted ? ' in its match host' : ''}` : ''})`);
       this.broadcastState(room);
       match.start();
+      if (room.matchCtx === ctx && !ctx.chat.closed) this.broadcastRoom(room, ctx.chat.snapshot());
     } catch (e) {
       this.log.error(`[lobby] ${room.code} match failed to start`, e);
       if (room.matchCtx === ctx) { room.match = null; room.matchCtx = null; room.matchKey = null; }
@@ -1440,6 +1634,7 @@ export class Lobby {
   onMatchEnd(room, ctx, summary) {
     if (ctx.ended || !ctx.live || room.matchCtx !== ctx || room.disposed) return;
     ctx.ended = true;
+    ctx.chat.clear();
     room.lastSummary = summary ?? null;
     room.match = null;
     room.matchCtx = null;
@@ -1459,6 +1654,8 @@ export class Lobby {
     for (const s of room.spectators) if (!s.connected) this.startGrace(room, s);
     const host = room.hostId ? room.seatOf(room.hostId) : null;
     if (!host || host.isBot || host.left) this.migrateHost(room);
+    this.trimBots(room);
+    this.promoteHostSeat(room);
     if (room.activeHumans().length === 0) this.disposeRoom(room, 'empty');
     else {
       this.broadcastState(room);
@@ -1470,6 +1667,7 @@ export class Lobby {
   /** Match unicast; m.result frames are also kept for the replay. */
   matchSend(room, ctx, playerId, msg) {
     if (msg && msg.t === 'm.result') {
+      ctx.chat.clear();
       const data = encode(msg);
       if (data != null) ctx.results.set(playerId, data);
     }
@@ -1478,6 +1676,7 @@ export class Lobby {
 
   /** Match broadcast; the latest m.public and a broadcast m.result are also kept for the replay. */
   matchBroadcast(room, ctx, msg) {
+    if (msg?.t === 'm.result' || (msg?.t === 'm.public' && msg.phase === PHASE.RESULT)) ctx.chat.clear();
     const data = this.broadcastRoom(room, msg);
     if (data == null) return;
     if (msg.t === 'm.public') ctx.lastPublic = data;
@@ -1556,6 +1755,7 @@ export class Lobby {
     session.resyncAt = this.now();
     if (room.match) {
       this.callMatch(room, room.spectatorOf(session.playerId) ? 'addSpectator' : 'onReconnect', session.playerId);
+      this.sendChatState(room, session.playerId);
       return;
     }
     const frames = this.replayFor(room, session.playerId);
@@ -1638,6 +1838,34 @@ export class Lobby {
     return matchAnswer(res);
   }
 
+  /** Match chat belongs to connected room humans, including eliminated/autoplay players and spectators. */
+  chat(session, { matchId, text }) {
+    const room = this.roomOf(session);
+    if (!room) return fail(ERR.NOT_IN_ROOM);
+    const ctx = room.matchCtx;
+    if (!room.match || !ctx?.live || ctx.ended || ctx.chat.closed || room.match.phase === PHASE.RESULT) {
+      return fail(ERR.WRONG_PHASE, 'no running chat match');
+    }
+    if (matchId !== ctx.chat.matchId) return fail(ERR.BAD_TARGET, 'stale chat match');
+    const member = room.seatOf(session.playerId) || room.spectatorOf(session.playerId);
+    if (!session.connected || this.registry.byId(session.playerId) !== session || !member || member.isBot || member.left || !member.connected) {
+      return fail(ERR.NOT_IN_ROOM);
+    }
+    const spectator = !!room.spectatorOf(session.playerId);
+    const res = ctx.chat.append({ playerId: member.playerId, name: member.name, seat: spectator ? null : member.seat,
+      spectator }, text);
+    if (res.error) return fail(res.error, res.detail);
+    this.broadcastRoom(room, res.message);
+    return OK;
+  }
+
+  /** Single bounded history on start/join/resume, under the existing heavy resync policy. */
+  sendChatState(room, playerId) {
+    const ctx = room.matchCtx;
+    if (!room.match || !ctx?.live || ctx.ended || ctx.chat.closed || room.match.phase === PHASE.RESULT) return;
+    this.sendToPlayer(room, playerId, ctx.chat.snapshot());
+  }
+
   /** Call an optional match hook without letting it throw. onLeave falls back to onDisconnect. */
   callMatch(room, method, ...args) {
     const m = room.match;
@@ -1657,6 +1885,7 @@ export class Lobby {
     if (ctx.disposed) return;
     ctx.disposed = true;
     ctx.live = false;
+    ctx.chat.clear();
     try { ctx.match?.dispose?.(); } catch (e) { this.log.error('[lobby] match.dispose threw', e); }
   }
 
@@ -1664,7 +1893,7 @@ export class Lobby {
     try { return this.getData(); } catch (e) { this.log.error('[lobby] getData failed', e); return Object.freeze({}); }
   }
 
-  /** How long a dropped solo run stays resumable (ms): the option, else data singleReconnectTime, else 24 h. */
+  /** Solo resume window (ms): option (default 2 h); explicit null/invalid retains the official 24 h data fallback. */
   soloResumeWindowMs() {
     const o = this.opts.soloReconnectWindowMs;
     if (typeof o === 'number' && Number.isFinite(o) && o > 0) return o;
@@ -1710,6 +1939,7 @@ export class Lobby {
    * @param {Room} room @param {string} playerId
    */
   removeMember(room, playerId) {
+    this.discovery.forget(playerId);
     const session = this.registry.byId(playerId);
     if (session && session.roomCode === room.code) session.roomCode = null;
     this.clearGrace(playerId);
@@ -1717,6 +1947,7 @@ export class Lobby {
     if (this.freeSpectatorSeat(room, playerId)) return;
     const seat = room.seatOf(playerId);
     if (!seat || seat.isBot || seat.left || room.disposed) return;
+    room.matchCtx?.chat.forgetPlayer(playerId);
     if (room.match) {
       seat.left = true;
       seat.connected = false;
@@ -1739,6 +1970,7 @@ export class Lobby {
     const i = room.spectators.findIndex((s) => s.playerId === playerId);
     if (i < 0) return false;
     room.spectators.splice(i, 1);
+    room.matchCtx?.chat.forgetPlayer(playerId);
     if (room.disposed) return true;
     this.callMatch(room, 'removeSpectator', playerId);
     this.broadcastState(room);
@@ -1751,10 +1983,24 @@ export class Lobby {
     const pick = humans.find((s) => s.connected) || humans[0] || null;
     const prev = room.hostId;
     room.hostId = pick ? pick.playerId : null;
+    this.promoteHostSeat(room);
     if (pick && prev !== pick.playerId) this.log.info(`[lobby] ${room.code} host → ${pick.name}`);
     // a running match follows the host change: its delegated bot rehearsals fall back to the server and later ones ask
     // the new host (DESIGN §14, Match.setHost)
     if (room.match && room.hostId !== prev) this.callMatch(room, 'setHost', room.hostId);
+  }
+
+  /** Change waiting-room seat order only; a running match owns its original seats and fixed pool groups. */
+  promoteHostSeat(room) {
+    if (room.match || !room.hostId) return;
+    const host = room.seatOf(room.hostId);
+    if (!host || host.isBot || host.left || host.seat === 0) return;
+    const oldIndex = host.seat;
+    const first = room.seats[0];
+    room.seats[0] = host;
+    host.seat = 0;
+    room.seats[oldIndex] = first;
+    if (first) first.seat = oldIndex;
   }
 
   startGrace(room, seat) {
@@ -1789,6 +2035,7 @@ export class Lobby {
     if (room.disposed) return;
     room.disposed = true;
     if (this.rooms.get(room.code) === room) { this.trustedRuntime?.event('roomClosed',{room:room.toState()}); this.rooms.delete(room.code); }
+    this.discovery.changed();
     const ctx = room.matchCtx;
     room.match = null;
     room.matchCtx = null;
@@ -1854,8 +2101,9 @@ export class Lobby {
       if (state.inMatch && !prev?.inMatch) event('matchStarted');
       room.trustedPrevious = state;
     }
-    const data = encode(room.toState());
-    for (const session of this.memberSessions(room)) sendRaw(session.ws, data);
+    this.discovery.changed();
+    const frame = prepareMessage(room.toState());
+    for (const session of this.memberSessions(room)) sendPrepared(session.ws, frame);
   }
 
   sendState(room, session) {
@@ -1865,10 +2113,11 @@ export class Lobby {
   /** Match broadcast: encode once, send to every connected member. @returns {string | null} the encoded frame */
   broadcastRoom(room, msg) {
     if (room.disposed) return null;
-    const data = encode(msg);
+    const frame = prepareMessage(msg);
+    const data = frame.json;
     if (data == null) { this.log.error(`[lobby] ${room.code} unserializable broadcast ${msg && msg.t}`); return null; }
     const droppable = isDroppable(msg);
-    for (const session of this.memberSessions(room)) sendRaw(session.ws, data, { droppable });
+    for (const session of this.memberSessions(room)) sendPrepared(session.ws, frame, { droppable });
     return data;
   }
 

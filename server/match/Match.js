@@ -211,6 +211,7 @@ import { DataSource } from '../sim/simdata.js';
 import { createRng, deriveSeed } from '../sim/rng.js';
 import { GameData } from './gamedata.js';
 import { RealScheduler } from './scheduler.js';
+import { FreezeScheduler } from './freezeScheduler.js';
 import { createPoolGroups, drawDisabledBonds } from './pool.js';
 import { PlayerState } from './PlayerState.js';
 import { EffectDispatcher, getDefaultRegistry } from './effectsMeta.js';
@@ -314,7 +315,7 @@ export class Match {
     /** 「AI 队友最后选择」 (opts.aiPicksLast, GitHub #338): humans draft before AI seats (MatchPhases.humansFirst) */
     this.aiPicksLast = !this.isSolo && opts.aiPicksLast === true;
     this.ownsScheduler = !opts.scheduler;
-    this.sched = opts.scheduler || new RealScheduler({ now: opts.now || Date.now, onError: (e) => this.reportError('timer', e) });
+    this.sched = new FreezeScheduler(opts.scheduler || new RealScheduler({ now: opts.now || Date.now, onError: (e) => this.reportError('timer', e) }), { ownsSource: this.ownsScheduler });
     this.registry = opts.registry || getDefaultRegistry();
     this.dispatcher = new EffectDispatcher(this, this.registry);
     this.BattleClass = typeof opts.BattleClass === 'function' ? opts.BattleClass : Battle;
@@ -388,6 +389,7 @@ export class Match {
      * next match of the room (the same socket, the same field ids) never names a battle of this match.
      */
     this.battlePrefix = `${this.seed.toString(36)}${Number.isInteger(opts.matchNo) && opts.matchNo > 0 ? `-${opts.matchNo.toString(36)}` : ''}`;
+    this.draftSeq = 0;
     this._progressTimer = null;
     this._bossClock = null;
     this._lastPoolAt = -Infinity;
@@ -445,6 +447,15 @@ export class Match {
     // match (player/diy.js initDiyStock); no randomness is drawn here
     const off = new Set([...bans.drawn, ...bans.staticOff]);
     for (const ps of this.order) ps.initDiyStock(off);
+
+    // 带宽熔断 (the server owner's bandwidth guard, server/bandwidthEmergency.js): the match freezes its own clocks
+    // while the host throttles downloads; lifecycle events raised during the freeze are queued and applied on resume.
+    this.emergencyFrozen = false;
+    this.emergencyFrozenAt = 0;
+    this.emergencyReason = null;
+    this.emergencyFrozenMs = 0;
+    this._emergencyLeaves = new Set();
+    this._emergencyLostAuthorities = new Set();
 
     this.phase = PHASE.LOBBY;
     this.round = 0;

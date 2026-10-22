@@ -3,6 +3,8 @@
 
 import { DIFFICULTIES, NAME_MAX_LEN, ROOM_CODE_LEN, MAX_SEATS, ROOM_CAPACITIES, MAX_DRAFT_CARDS, EMOTES, GEO } from './constants.js';
 import { isDroppableChess } from './standIn.js';
+import { isAssetCacheReadiness } from './assetCache.js';
+import { isChatTextInput } from './matchChat.js';
 import { diySlotIds, validateDiyPicks } from './diy.js';
 import { cultivatedStats, isPotential, isCultivate, POTENTIAL_DEFAULT, CULTIVATE_DEFAULT, hasPotentialData } from './potential.js';
 import { isContentHash } from './plugins/identity.js';
@@ -15,6 +17,7 @@ const isInt = (v, lo = -Infinity, hi = Infinity) => Number.isInteger(v) && v >= 
 const isStr = (v, max = 64) => typeof v === 'string' && v.length <= max;
 const isBool = (v) => typeof v === 'boolean';
 const isId = (v) => typeof v === 'string' && v.length > 0 && v.length <= 64 && /^[A-Za-z0-9_\-.:]+$/.test(v);
+const isRoomId = (v) => isStr(v, 36) && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(v);
 const isUid = (v) => isInt(v, 1, 2 ** 31);
 const isNum = (v, lo = -Infinity, hi = Infinity) => typeof v === 'number' && Number.isFinite(v) && v >= lo && v <= hi;
 const isPlain = (v) => !!v && typeof v === 'object' && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
@@ -502,16 +505,27 @@ export const C2S = {
   ping: { c: (v) => typeof v === 'number' && Number.isFinite(v) },
   // test: only the literal true (DESIGN §34.8). Omit it for a normal room — `false` is a bad field, so a
   // string cannot sneak in as "not a test". The server still refuses it unless SP_TEST_MODE is on.
-  'room.create': { mode: (v) => v === 'solo' || v === 'coop', difficulty: (v) => DIFFICULTIES.includes(v), test: (v) => v === true, $optional: ['test'] },
-  'room.join': { $optional: ['testAck'], testAck: (v) => v === true, code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },
+  'lobby.watch': { on: isBool, list: isBool, page: (v) => isInt(v, 0, 1e6), $optional: ['list', 'page'] },
+  'lobby.quickMatch': { capacity: (v) => ROOM_CAPACITIES.includes(v), assetCache: isAssetCacheReadiness,
+    $optional: ['capacity', 'assetCache'] },
+  'lobby.join': { roomId: isRoomId, assetCache: isAssetCacheReadiness, $optional: ['assetCache'] },
+  'lobby.spectate': { roomId: isRoomId, assetCache: isAssetCacheReadiness, $optional: ['assetCache'] },
+  'room.create': { mode: (v) => v === 'solo' || v === 'coop', difficulty: (v) => DIFFICULTIES.includes(v),
+    capacity: (v) => ROOM_CAPACITIES.includes(v), test: (v) => v === true, $optional: ['capacity', 'test'] },
+  'room.join': { $optional: ['testAck', 'assetCache'], testAck: (v) => v === true,
+    code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v), assetCache: isAssetCacheReadiness },
   'room.leave': {},
   'room.ready': { ready: isBool },
   'room.setDifficulty': { difficulty: (v) => DIFFICULTIES.includes(v) },
   // the co-op room option 「AI 队友最后选择」 (GitHub #338; host, before the match): the strategy and 机变 drafts order every
   // human seat before every AI seat (server/match/match/phases.js humansFirst); room.state.aiPicksLast
   'room.setAiPicksLast': { on: isBool },
+  'room.setCapacity': { capacity: (v) => ROOM_CAPACITIES.includes(v) },
+  'room.setMatchmaking': { allowed: isBool },
+  'room.transferHost': { playerId: isId },
+  'room.chat': { matchId: isId, text: isChatTextInput },
   'room.addBot': {},
-  'room.removeBot': { seat: (v) => isInt(v, 0, MAX_SEATS - 1) },
+  'room.removeBot': { seat: (v) => isInt(v, 0, MAX_SEATS - 1), playerId: isId, $optional: ['playerId'] },
   // the host removes another human before the match (server/lobby.js kick; community report #17); playerId = the one the
   // host confirmed — a seat that changed hands meanwhile is refused
   'room.kick': { seat: (v) => isInt(v, 0, MAX_SEATS - 1), playerId: isId },
@@ -533,7 +547,8 @@ export const C2S = {
   // spectator seats (remake feature, community report #26; MAX_SPECTATORS): take one of a co-op room's spectator seats —
   // in its lobby or while its match runs — never a player seat; the host frees one by playerId (the spectator gets
   // room.closed { reason: 'kicked' }). room.leave / g.leave leave a spectator seat like a player seat.
-  'room.spectate': { $optional: ['testAck'], testAck: (v) => v === true, code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v) },
+  'room.spectate': { $optional: ['testAck', 'assetCache'], testAck: (v) => v === true,
+    code: (v) => isStr(v, ROOM_CODE_LEN + 2) && /^[A-Za-z0-9]+$/.test(v), assetCache: isAssetCacheReadiness },
   'room.removeSpectator': { playerId: isId },
   // the room's plugins (DESIGN §32, P1a; host, before the match — like a difficulty change it un-readies the others):
   // the plugins of this server the room switches on, in any order (the server closes the set over their requirements

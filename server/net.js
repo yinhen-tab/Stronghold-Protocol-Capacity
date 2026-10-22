@@ -3,8 +3,8 @@
 // Responsibilities:
 //   * Session objects (playerId, secret reconnect token, name, bound socket, connection state) and the
 //     SessionRegistry that resolves reconnect tokens and expires sessions after the reconnect window (10 min; the
-//     lobby may extend it per session via `session.resumeWindowMs` — a solo run: 24 h, see server/lobby.js).
-//   * Per-connection pipeline: token-bucket rate limit (40 msg/s) → JSON decode → schema validation
+//     lobby may extend it per session via `session.resumeWindowMs` — a solo run: default 2 h, see server/lobby.js).
+//   * Per-connection pipeline: token-bucket rate limit (40 msg/s) → JSON/negotiated wire decode → schema validation
 //     (shared/protocol.js) → `hello`/`ping` handling → dispatch to the lobby handler → `ok`/`error`
 //     reply echoing the request id (`rid`). Intents whose answer is a large state resend (`g.watch` →
 //     m.field) also draw from a second, much smaller bucket (2/s, burst 6), so one socket cannot turn
@@ -32,9 +32,9 @@
 //   welcomeInfo() → object (optional)      extra fields of every `welcome` (never one of its own keys): the lobby's
 //                                          `diyKitted` (0.2.0 自选编队 — which operators a DIY slot may field) and
 //                                          `content` ({ vanilla: <cs> }, the server's content hash — DESIGN §32)
-//   onMessage(session, msg) → { ok: true } | { error: ERR code, detail?: string } | undefined — or a Promise of one
-//                                          (a room whose match runs in a match host worker, DESIGN §32.6: the reply
-//                                          goes out when it settles; a rejection is INTERNAL)
+//   onMessage(session, msg) → { ok: true, reply?: object } | { error: ERR code, detail?: string } | undefined — or a
+//                                          Promise of one (a room whose match runs in a match host worker, DESIGN
+//                                          §32.6: the reply goes out when it settles; a rejection is INTERNAL)
 //   routeGame(session, msg) → same (optional): client-side combat reports `b.progress` / `b.result` (DESIGN §14) go
 //                                          straight to the running match through it; without it they reach onMessage
 //   onDisconnect(session)                  the session's socket closed (session kept for the reconnect window)
@@ -44,9 +44,11 @@ import { randomBytes } from 'node:crypto';
 import { isIP } from 'node:net';
 import { C2S, validateC2S } from '../shared/protocol.js';
 import { ERR, ERR_TEXT, NAME_MAX_LEN, PROTOCOL_VERSION } from '../shared/constants.js';
+import { WIRE_VERSION, encodeWire, decodeWire } from '../shared/wireCodec.js';
 
 /** Tunables (all overridable through the Network / SessionRegistry constructors). */
 export const NET_DEFAULTS = Object.freeze({
+  compactWire: process.env.SP_COMPACT_WIRE !== '0',
   ratePerSec: 40,               // token bucket refill rate
   rateBurst: 40,                // token bucket capacity
   abuseDropsPerSec: 400,        // rate-limited messages within one second before the socket is closed (1008)
@@ -71,8 +73,11 @@ export const NET_DEFAULTS = Object.freeze({
  * (taking a spectator seat in a running match resends its state like a watcher's g.watch — server/lobby.js spectate) and
  * room.setPlugins (a new visual set: every member downloads its art manifest — server/plugins/visualSet.js).
  * room.skins (docs/SKINS.md) is a small `{ [charId]: skinId }` map, sent on every edit of the appearance.
+ * lobby.spectate / lobby.watch with on:true/list:true: a paginated room directory, at most 50 rows per reply
+ * (server/lobbyDiscovery.js).
  */
-export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate', 'room.setPlugins', 'room.skins']);
+export const HEAVY_TYPES = new Set(['g.watch', 'room.loadout', 'room.ownership', 'room.diy', 'room.spectate',
+  'lobby.spectate', 'lobby.watch', 'room.setPlugins', 'room.skins']);
 
 /** Close codes (see header). */
 export const CLOSE = Object.freeze({ REPLACED: 4001, HELLO_TIMEOUT: 4002, POLICY: 1008, SHUTDOWN: 1001 });
@@ -132,7 +137,7 @@ export class Session {
     this.limitKey = null;
     /**
      * @type {number | null} lobby-owned extension of the reconnect window for this session (ms; null = the registry's
-     * window). A solo run keeps its session resumable for the official `singleReconnectTime` (24 h) — see lobby.js.
+     * window). A solo run keeps its session resumable for 2 h by default — see lobby.js.
      */
     this.resumeWindowMs = null;
   }
@@ -175,11 +180,11 @@ export class SessionRegistry {
   }
 
   /** @param {unknown} token @returns {Session | null} a live (non-expired) session for this token */
-  byToken(token) {
+  byToken(token, { allowExpired = () => false } = {}) {
     if (typeof token !== 'string' || token.length === 0) return null;
     const s = this.byTokenMap.get(token);
     if (!s) return null;
-    if (this.isExpired(s, this.now())) return null;
+    if (this.isExpired(s, this.now()) && !allowExpired(s)) return null;
     return s;
   }
 
@@ -274,6 +279,36 @@ export function encode(msg) {
 }
 
 const onSendDone = (err) => { void err; }; // errors surface through the socket's 'error'/'close' events
+// A transport capability belongs to the physical socket, never the room/session that survives reconnects.
+const wireVersions = new WeakMap();
+// Frozen matches retain their socket even if an old queue is already full. Do not grow that queue;
+// resync/recovery supplies state later. Ordinary operation retains the existing hard-buffer guard.
+const emergencySockets = new WeakSet();
+
+export const wireVersionOf = (ws) => ws ? wireVersions.get(ws) || 0 : 0;
+const setWireVersion = (ws, version) => wireVersions.set(ws, version);
+
+/** Encode JSON once per broadcast; compact JSON is generated lazily once, shared with every v1 recipient. */
+export function prepareMessage(msg) {
+  const json = encode(msg);
+  let compact;
+  return {
+    json,
+    get compact() {
+      if (compact === undefined) {
+        try { compact = JSON.stringify(encodeWire(JSON.parse(json), 's2c')); }
+        catch { compact = json; } // Preserve the existing readable protocol if a future shape is not representable.
+      }
+      return compact;
+    },
+  };
+}
+
+/** A prepared broadcast is immutable JSON text; compression contexts remain per socket in ws. */
+export function sendPrepared(ws, frame, opts) {
+  if (!frame || frame.json == null) return false;
+  return queueRaw(ws, wireVersionOf(ws) === WIRE_VERSION ? frame.compact : frame.json, opts);
+}
 
 /**
  * Send an already-encoded frame. Skips when the socket is not OPEN, when `droppable` and the socket is
@@ -284,10 +319,21 @@ const onSendDone = (err) => { void err; }; // errors surface through the socket'
  * @returns {boolean} true when the frame was queued
  */
 export function sendRaw(ws, data, { droppable = false } = {}) {
+  // Stored end-of-match frames and lobby summaries use legacy JSON; replay through the same negotiated boundary.
+  if (wireVersionOf(ws) === WIRE_VERSION && typeof data === 'string') {
+    try { data = JSON.stringify(encodeWire(JSON.parse(data), 's2c')); } catch { /* legacy fallback */ }
+  }
+  return queueRaw(ws, data, { droppable });
+}
+
+function queueRaw(ws, data, { droppable = false } = {}) {
   if (!ws || ws.readyState !== WS_OPEN || typeof data !== 'string') return false;
   try {
     const queued = ws.bufferedAmount;
-    if (queued > NET_DEFAULTS.hardBufferBytes) { ws.terminate(); return false; }
+    if (queued > NET_DEFAULTS.hardBufferBytes) {
+      if (!emergencySockets.has(ws)) ws.terminate();
+      return false;
+    }
     if (droppable && queued > NET_DEFAULTS.snapDropBytes) return false;
     ws.send(data, onSendDone);
     return true;
@@ -306,9 +352,7 @@ export const isDroppable = (msg) => !!msg && msg.t === 'b.snap';
  * @returns {boolean}
  */
 export function send(ws, msg) {
-  const data = encode(msg);
-  if (data == null) return false;
-  return sendRaw(ws, data, { droppable: isDroppable(msg) });
+  return sendPrepared(ws, prepareMessage(msg), { droppable: isDroppable(msg) });
 }
 
 /**
@@ -492,6 +536,8 @@ class Connection {
     this.key = addr.key;
     this.openedAt = now;
     this.alive = true;
+    this.pendingPingAt = null;
+    this.pongRttMs = 0;
     /** @type {Session | null} */
     this.session = null;
     this.bucket = new TokenBucket(opts.ratePerSec, opts.rateBurst, now);
@@ -534,6 +580,7 @@ export class Network {
     /** @type {Map<string, number>} open sockets per client network key */
     this.connsPerKey = new Map();
     this.closed = false;
+    this.emergency = { active: false, reason: null, since: 0, retryAt: 0 };
     this.heartbeatTimer = setInterval(() => this.heartbeat(), this.opts.heartbeatMs);
     this.heartbeatTimer.unref?.();
     const sweepMs = Math.max(20, Math.min(15_000, Math.floor(this.opts.reconnectWindowMs / 4)));
@@ -543,6 +590,51 @@ export class Network {
 
   /** Number of open sockets. */
   get connectionCount() { return this.conns.size; }
+
+  /** A tiny non-droppable notice goes before match resyncs; never disconnect existing players. */
+  setEmergency(state) {
+    const previous = this.emergency;
+    const active = !!state.active;
+    this.emergency = { active, reason: active ? state.reason || 'bandwidth' : null,
+      since: active ? state.startedAt || state.since || this.now() : 0,
+      retryAt: active ? state.retryAt || 0 : 0 };
+    if (previous.active && !active) {
+      // The reconnect window must not expire merely because the server froze the match.
+      const now = this.now();
+      for (const session of this.registry.all()) {
+        if (!session.connected && session.disconnectedAt != null && this.handler.allowEmergencyResume?.(session)) {
+          session.disconnectedAt += Math.max(0, now - Math.max(previous.since, session.disconnectedAt));
+        }
+      }
+    }
+    const frame = prepareMessage({ t: 'm.emergency', ...this.emergency });
+    for (const [ws, conn] of this.conns) {
+      if (active && conn.session && this.handler.allowEmergencyResume?.(conn.session)) emergencySockets.add(ws);
+      else emergencySockets.delete(ws);
+      if (!conn.closing) sendPrepared(ws, frame);
+    }
+  }
+
+  /** Only gameplay connections corroborate a slow downloader; a slow visitor cannot freeze other matches. */
+  congestion() {
+    let congestedConnections = 0; let maxBufferedBytes = 0; let delayedHeartbeats = 0;
+    let activeConnections = 0;
+    const activeNetworks = new Set(); const congestedNetworks = new Set(); const delayedNetworks = new Set();
+    const now = this.now();
+    for (const [ws, conn] of this.conns) {
+      if (conn.closing || !conn.session || !this.handler.roomOf?.(conn.session)?.match) continue;
+      activeConnections++;
+      const key = conn.key || conn.session.playerId;
+      activeNetworks.add(key);
+      const bytes = Number(ws.bufferedAmount) || 0;
+      maxBufferedBytes = Math.max(maxBufferedBytes, bytes);
+      if (bytes >= 64 * 1024) { congestedConnections++; congestedNetworks.add(key); }
+      if (conn.pendingPingAt != null && now - conn.pendingPingAt > 3000) { delayedHeartbeats++; delayedNetworks.add(key); }
+    }
+    return { activeConnections, activeNetworks: activeNetworks.size, congestedConnections,
+      congestedNetworks: congestedNetworks.size, delayedHeartbeats, delayedNetworks: delayedNetworks.size,
+      impairedNetworks: new Set([...congestedNetworks, ...delayedNetworks]).size, maxBufferedBytes };
+  }
 
   /**
    * Upgrade-time admission check (server/http/websocket.js): null to accept, otherwise the reason to refuse.
@@ -571,7 +663,13 @@ export class Network {
     ws.on('message', (data, isBinary) => {
       try { this.onFrame(conn, data, isBinary); } catch (e) { this.log.error('[net] frame handler crashed', e); }
     });
-    ws.on('pong', () => { conn.alive = true; if (conn.session && conn.session.ws === ws) conn.session.lastSeen = this.now(); });
+    ws.on('pong', () => {
+      const now = this.now();
+      conn.alive = true;
+      if (conn.pendingPingAt != null) conn.pongRttMs = Math.max(0, now - conn.pendingPingAt);
+      conn.pendingPingAt = null;
+      if (conn.session && conn.session.ws === ws) conn.session.lastSeen = now;
+    });
     ws.on('error', (e) => { this.log.debug?.('[net] socket error', e?.code || e?.message); });
     ws.on('close', () => { try { this.onClose(conn); } catch (e) { this.log.error('[net] close handler crashed', e); } });
   }
@@ -595,13 +693,19 @@ export class Network {
         conn.close(CLOSE.POLICY, 'rate limit');
         return;
       }
-      this.reply(conn, errorMsg(ERR.RATE, peekRid(data, isBinary)));
+      this.reply(conn, errorMsg(ERR.RATE, peekRid(data, isBinary, wireVersionOf(conn.ws))));
       return;
     }
 
     if (isBinary) { this.reply(conn, errorMsg(ERR.BAD_MSG, undefined, 'binary frame')); return; }
     let msg;
-    try { msg = JSON.parse(data.toString('utf8')); } catch { this.reply(conn, errorMsg(ERR.BAD_MSG, undefined, 'invalid json')); return; }
+    try {
+      msg = JSON.parse(data.toString('utf8'));
+      if (Array.isArray(msg)) {
+        if (wireVersionOf(conn.ws) !== WIRE_VERSION) throw new Error('wire not negotiated');
+        msg = decodeWire(msg, 'c2s');
+      }
+    } catch { this.reply(conn, errorMsg(ERR.BAD_MSG, undefined, 'invalid json or compact wire')); return; }
     const rid = msg && typeof msg === 'object' ? msg.rid : undefined;
     // Own-property check first: validateC2S alone would accept inherited keys like "constructor".
     if (!msg || typeof msg !== 'object' || Array.isArray(msg) || typeof msg.t !== 'string' || !Object.hasOwn(C2S, msg.t)) {
@@ -620,7 +724,10 @@ export class Network {
     }
     if (msg.t === 'hello') { this.onHelloMsg(conn, msg, now); return; }
     if (!conn.session) { this.reply(conn, errorMsg(ERR.BAD_MSG, rid, 'hello required')); return; }
-    if (HEAVY_TYPES.has(msg.t) && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
+    // Lobby presence is a small summary and unsubscription is cleanup; only an opened paged directory
+    // consumes the heavy-response budget. This keeps a rapid close/route change from leaving a stale watcher.
+    const heavy = HEAVY_TYPES.has(msg.t) && !(msg.t === 'lobby.watch' && (!msg.on || !msg.list));
+    if (heavy && !conn.heavy.take(now)) { this.reply(conn, errorMsg(ERR.RATE, rid, `${msg.t} too often`)); return; }
 
     let res;
     try {
@@ -657,7 +764,7 @@ export class Network {
       // surface as an error toast in the browser)
       if (msg.t === 'b.progress' && !validRid(rid)) return;
       this.reply(conn, errorMsg(isErrCode(res.error) ? res.error : ERR.INTERNAL, rid, res.detail));
-    } else if (validRid(rid)) this.reply(conn, { t: 'ok', rid });
+    } else if (validRid(rid)) this.reply(conn, res?.reply ? { ...res.reply, rid } : { t: 'ok', rid });
   }
 
   /** @param {Connection} conn @param {any} msg @param {number} now */
@@ -674,7 +781,16 @@ export class Network {
     let resumed = false;
     const repeat = !!session;
     if (!session) {
-      session = msg.token ? this.registry.byToken(msg.token) : null;
+      session = msg.token ? this.registry.byToken(msg.token, { allowExpired: (s) =>
+        this.emergency.active && !!this.handler.allowEmergencyResume?.(s) }) : null;
+      // Upgrade cannot identify a resume token. Reject before allocating/replacing any identity,
+      // while preserving running matches' original members' authenticated reconnects.
+      if (this.emergency.active && (!session || !this.handler.allowEmergencyResume?.(session))) {
+        this.reply(conn, { t: 'm.emergency', ...this.emergency });
+        this.reply(conn, errorMsg(ERR.SERVER_EMERGENCY, rid));
+        conn.close(CLOSE.POLICY, 'bandwidth emergency');
+        return;
+      }
       if (session) {
         if (session.connected && session.ws && session.ws !== conn.ws
           && (msg.noReplace || (Number.isFinite(msg.claimAt) && session.claimAt != null && msg.claimAt > session.claimAt))) {
@@ -697,12 +813,18 @@ export class Network {
     session.lastSeen = now;
     session.addr = conn.ip;
     session.limitKey = conn.key;
+    if (this.emergency.active && this.handler.allowEmergencyResume?.(session)) emergencySockets.add(conn.ws);
 
     let extra = null;
     try { extra = this.handler.welcomeInfo?.() ?? null; } catch (e) { this.log.error('[net] welcomeInfo crashed', e); }
-    const welcome = { ...(extra && typeof extra === 'object' ? extra : null), t: 'welcome', playerId: session.playerId, token: session.token, name: session.name, serverNow: now, version: PROTOCOL_VERSION, resumed };
+    const welcome = { ...(extra && typeof extra === 'object' ? extra : null), t: 'welcome', playerId: session.playerId, token: session.token, name: session.name, serverNow: now, version: PROTOCOL_VERSION, resumed,
+      emergency: this.emergency };
+    const wire = this.opts.compactWire && msg.wire === WIRE_VERSION ? WIRE_VERSION : 0;
+    if (wire) welcome.wire = wire;
     if (validRid(rid)) welcome.rid = rid;
-    this.reply(conn, welcome);
+    // Repeated hello may renegotiate too. The acknowledgement is always readable JSON and precedes all pushes.
+    setWireVersion(conn.ws, wire);
+    queueRaw(conn.ws, encode(welcome));
     try {
       this.handler.onHello?.(session, { resumed, repeat });
     } catch (e) {
@@ -753,8 +875,13 @@ export class Network {
           conn.close(CLOSE.HELLO_TIMEOUT, 'hello timeout');
           continue;
         }
-        if (!conn.alive) { conn.ws.terminate(); continue; }
+        if (!conn.alive && !(this.emergency.active && conn.session && this.handler.allowEmergencyResume?.(conn.session))) {
+          conn.ws.terminate(); continue;
+        }
         conn.alive = false;
+        // Keep the oldest unanswered heartbeat: repeated pings during protection must not
+        // give a persistently unreachable player a fresh apparently healthy recovery window.
+        conn.pendingPingAt ??= now;
         conn.ws.ping();
       } catch (e) {
         this.log.debug?.('[net] heartbeat error', e?.message);
@@ -765,7 +892,12 @@ export class Network {
   /** Purge expired sessions and tell the handler. */
   sweep() {
     let expired;
-    try { expired = this.registry.sweep(this.now()); } catch (e) { this.log.error('[net] sweep crashed', e); return; }
+    try {
+      // Do not remove a frozen match's original seats while the server is refusing newcomers.
+      expired = [...this.registry.all()].filter((session) => this.registry.isExpired(session, this.now())
+        && !(this.emergency.active && this.handler.allowEmergencyResume?.(session)));
+      for (const session of expired) this.registry.remove(session);
+    } catch (e) { this.log.error('[net] sweep crashed', e); return; }
     for (const s of expired) {
       try { this.handler.onExpire?.(s); } catch (e) { this.log.error('[net] onExpire crashed', e); }
     }
@@ -789,10 +921,11 @@ export class Network {
 }
 
 /** Best-effort rid extraction for rate-limited frames (so the client's pending request resolves). */
-function peekRid(data, isBinary) {
+function peekRid(data, isBinary, wire = 0) {
   if (isBinary || !data || data.length > PEEK_RID_MAX_BYTES) return undefined;
   try {
-    const m = JSON.parse(data.toString('utf8'));
+    const raw = JSON.parse(data.toString('utf8'));
+    const m = Array.isArray(raw) && wire === WIRE_VERSION ? decodeWire(raw, 'c2s') : raw;
     return m && typeof m === 'object' ? m.rid : undefined;
   } catch {
     return undefined;
