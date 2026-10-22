@@ -211,7 +211,7 @@ import { DataSource } from '../sim/simdata.js';
 import { createRng, deriveSeed } from '../sim/rng.js';
 import { GameData } from './gamedata.js';
 import { RealScheduler } from './scheduler.js';
-import { SharedPool, SharedItemPool, drawDisabledBonds } from './pool.js';
+import { createPoolGroups, drawDisabledBonds } from './pool.js';
 import { PlayerState } from './PlayerState.js';
 import { EffectDispatcher, getDefaultRegistry } from './effectsMeta.js';
 import { setupMatchWaves } from './waves.js';
@@ -438,8 +438,9 @@ export class Match {
     this.disabledBonds = bans.drawn;
     this.staticInactiveBonds = bans.staticOff;
     this.bannedChess = bans.banned;
-    this.pool = new SharedPool(this.gd, { banned: bans.banned });
-    this.itemPool = new SharedItemPool(this.gd, () => this.order);
+    this.poolGroups = createPoolGroups(this.gd, this.order, { banned: bans.banned });
+    this.playerPools = new Map(this.poolGroups.flatMap((g) => g.playerIds.map((id) => [id, g.pool])));
+    this.pool = this.poolGroups[0].pool;
     // 自选编队 (0.2.0): each human's slotted DIY pieces get their own stock — none for one whose bonds are all off this
     // match (player/diy.js initDiyStock); no randomness is drawn here
     const off = new Set([...bans.drawn, ...bans.staticOff]);
@@ -509,6 +510,14 @@ export class Match {
     // so one callback cannot run to HARD_CAP_SECONDS. Virtual time stays unbounded (the defaults
     // above). The input journal records the steps that callback took; replay stops there.
     if (this.test && opts.journal !== false) installTestTrace(this, opts);
+  }
+
+  /** First-group compatibility for diagnostics; player transactions always select their fixed group. */
+  get itemPool() { return this.poolGroups[0]?.itemPool; }
+
+  itemPoolFor(player) {
+    const playerId = typeof player === 'string' ? player : player?.playerId;
+    return this.poolGroups.find((g) => g.playerIds.includes(playerId))?.itemPool || this.itemPool;
   }
 }
 

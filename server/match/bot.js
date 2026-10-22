@@ -136,6 +136,12 @@ const LAYER_TRAIT_RE = /BOND|LAYER/;
 const ECON_TRAIT_RE = /GOLD|REFRESH|COIN/;
 const DEFAULT_MELEE_RANGE = [[0, 0], [0, 1]];
 
+/** Copy competition belongs to one fixed opening pool; departed/eliminated seats never reserve a bond. */
+function poolMates(m, ps) {
+  const pool = typeof m.poolFor === 'function' ? m.poolFor(ps) : null;
+  return m.alivePlayers().filter(p => p !== ps && !p.left && (pool == null || m.poolFor(p) === pool));
+}
+
 /**
  * Band pick among the strategies the mode offers (gd.bandIds): weighted by starting LP (sturdier strategies are
  * preferred). Alone, a band that withholds the first rounds' funds (老鲤 "资金暂存": no operator in R1–R2, every enemy
