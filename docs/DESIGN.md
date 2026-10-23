@@ -20,6 +20,10 @@ The 0.3.1 sim investigation and rule correction are [§34.32](history/0.3.1.md#3
 瑕光 S2 retains sleeper targeting and attack replay events; 琳琅诗怀雅 S3 keeps double attacks and coins at the cap,
 following the official mode's no-auto-close rule. Current contracts: [design/engine.md](design/engine.md).
 
+Picture-only outfits become wearable under the maintainer's 2026-10-18 option A in
+[§35.4](history/0.3.2.md#354-picture-only-outfits-b6): per-seat pictures with default battle models;
+current rendering rules are in [design/client.md](design/client.md) and [SKINS.md](SKINS.md).
+
 ## Where each section lives
 
 Studio §32.9 gains five graphical gameplay templates and isolated Match exercises in
