@@ -146,6 +146,9 @@ export const ERR = Object.freeze({
   NOT_IN_ROOM: 'NOT_IN_ROOM',
   ROOM_NOT_FOUND: 'ROOM_NOT_FOUND',
   ROOM_FULL: 'ROOM_FULL',
+  AI_LIMIT: 'AI_LIMIT',           // the room already holds the server owner's AI ceiling (room.addBot)
+  ASSET_CACHE_REQUIRED: 'ASSET_CACHE_REQUIRED', // the owner requires a finished asset cache before joining
+  SERVER_EMERGENCY: 'SERVER_EMERGENCY',         // the bandwidth emergency is protecting the server
   ROOM_STARTED: 'ROOM_STARTED',
   NOT_HOST: 'NOT_HOST',
   NOT_READY: 'NOT_READY',
@@ -201,6 +204,9 @@ export const ERR_TEXT = {
   BAD_TILE: N_('无法部署在该位置'), BAD_TARGET: N_('无效的目标'), SOLD_OUT: N_('已售出'), MAX_LEVEL: N_('调度中心已达最高等级'),
   NOT_YOUR_TURN: N_('尚未轮到你'), ALREADY: N_('已完成该操作'), TEMP_NOT_EMPTY: N_('临时整备区不为空'), ELIMINATED: N_('你已被淘汰'),
   SPECTATOR: N_('观战中无法进行该操作'), INTERNAL: N_('服务器内部错误'),
+  AI_LIMIT: N_('已达到服务器允许的 AI 队友上限'),
+  ASSET_CACHE_REQUIRED: N_('服主要求完整预缓存，请先在「预缓存」中导入当前素材目录并补齐全部文件，再创建、加入、最快匹配或观战。'),
+  SERVER_EMERGENCY: N_('服务器带宽紧急保护已开启，请等待恢复'),
   PLUGIN_UNKNOWN: N_('本服务器没有安装该插件'), PLUGIN_BLOCKED: N_('该插件不能在房间中启用'), PLUGIN_DEPENDENCY: N_('缺少该插件需要的其他插件'),
   PLUGIN_CONFLICT: N_('所选插件互相冲突'), PLUGIN_LIMIT: N_('所选插件的素材总量超出本服务器的上限'),
   PLUGIN_RULE_CONFLICT: N_('两个插件把同一个规则开关设成了不同的选项'),

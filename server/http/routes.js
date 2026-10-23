@@ -78,11 +78,12 @@ const wantsTraffic = (query) => /(?:^|&)traffic(?:=(?:1|true|yes))?(?:&|$)/i.tes
  * The request listener for `http.createServer`.
  * @param {{ serveStatic: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse,
  *             rawPath: string, query: string) => Promise<void>,
- *           health: Parameters<typeof healthReport>[0], log: object, trustProxy?: 'auto' | boolean,
+ *           health?: Parameters<typeof healthReport>[0], log: object, trustProxy?: 'auto' | boolean,
  *           csp?: string | null,
  *           studio?: { handles: (rawPath: string) => boolean, handle: (req: any, res: any, rawPath: string, query: string) => Promise<void> } | null }} deps
- *   trustProxy: whose forwarding headers name the client (net.js clientAddress; the server's TRUST_PROXY); studio: the
- *   plugin studio (server/studio/index.js), or none
+ *   health: optional — a caller that mounts only some routes (the asset-cache tests do) may omit it; `/healthz` then
+ *   answers from the fields it has. trustProxy: whose forwarding headers name the client (net.js clientAddress; the
+ *   server's TRUST_PROXY); studio: the plugin studio (server/studio/index.js), or none
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void}
  */
 export function createRequestHandler({ serveStatic, health, log, announcements = null, assetCache = null,
@@ -143,7 +144,7 @@ export function createRequestHandler({ serveStatic, health, log, announcements =
   return (req, res) => {
     setSecurityHeaders(res);
     if (csp) res.setHeader('Content-Security-Policy', csp);
-    if (health.traffic) health.traffic.meter(res, splitUrl(req.url || '/')?.rawPath || '/');
+    if (health?.traffic) health.traffic.meter(res, splitUrl(req.url || '/')?.rawPath || '/');
     handleRequest(req, res).catch((e) => {
       log.error('[http] request failed', e);
       sendError(req, res, 500, '服务器内部错误 · Internal error');
