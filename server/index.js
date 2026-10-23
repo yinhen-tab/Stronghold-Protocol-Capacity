@@ -56,6 +56,11 @@ import { MIME, COMPRESSIBLE, acceptsGzip, pickEncoding, parseRange } from './htt
 import { BUILD_INPUTS, computeBuildTag, buildTag, resetBuildTag } from './http/buildTag.js';
 import { createRequestHandler } from './http/routes.js';
 import { createTrafficCounter } from './http/traffic.js';
+import { createAnnouncementStore } from './announcements.js';
+import { createAnnouncementNoticeMonitor } from './announcementNotices.js';
+import { createServerSettings } from './serverSettings.js';
+import { createAssetCacheHandler } from './http/assetCache.js';
+import { createBandwidthEmergencyController, bandwidthEmergencyOptions } from './bandwidthEmergency.js';
 import { createAssetIndex } from './http/assetIndex.js';
 import { createManifestViews } from './http/assetViews.js';
 import { answerClientError } from './http/common.js';
@@ -127,6 +132,41 @@ export async function startServer(opts = {}) {
   const hosts = createMatchHosts({ contents, log, options: { transport, maxWorkers: Math.max(1, policy.get().maxSets), ...(opts.matchHost || {}) } });
   const { registry, lobby, network } = createSessionStack(opts, { data, log, content, plugins: roomSets, hosts });
   const serveStatic = createStaticHandler({ publicDir, dataDir, sharedDir, simDir, packsDir, pluginsDir, packs, content, log, assetIndex, views, visual, contents });
+  // the owner's persisted settings (server/serverSettings.js): the AI ceiling, the asset-cache policy and the
+  // bandwidth emergency's switch — read once here, watched afterwards
+  const serverSettings = createServerSettings({ dir: opts.serverSettingsDir, root: ROOT, log,
+    onChange: (next) => applySettings(next) });
+  // the owner's announcements (server/announcements.js): the list the title screen shows and one article's page
+  const announcements = createAnnouncementStore({ dir: opts.announcementsDir, root: ROOT, log });
+  const announcementNotices = createAnnouncementNoticeMonitor({ store: announcements, network, log });
+  // the asset cache (server/http/assetCache.js): this installation's own copy of the art, served on demand
+  const fallbackAssetCacheLimits = opts.assetCacheLimits;
+  const initialAssetCacheLimits = serverSettings.get().assetCacheLimits ?? fallbackAssetCacheLimits ?? undefined;
+  const assetCache = createAssetCacheHandler({ publicDir, dataDir, log, limits: initialAssetCacheLimits,
+    trustProxy: opts.trustProxy, buildCatalog: opts.assetCacheBuildCatalog,
+    requireAssetCache: () => serverSettings.get().requireAssetCache });
+  let warmingAssetSummary = null;
+  function warmAssetSummary() {
+    if (!warmingAssetSummary) warmingAssetSummary = assetCache.summary()
+      .catch((error) => { log.warn('[asset-cache] admission summary unavailable', error.message); })
+      .finally(() => { warmingAssetSummary = null; });
+    return warmingAssetSummary;
+  }
+  // the bandwidth emergency (server/bandwidthEmergency.js): the owner's switch for the server's protection mode
+  const emergencyOptions = bandwidthEmergencyOptions(opts.bandwidthEmergency === false ? { enabled: false } : opts.bandwidthEmergency || {});
+  let bandwidthEmergency = null;
+  function applySettings(next) {
+    lobby.setAiLimit(next.maxAiPerRoom);
+    lobby.setAssetCachePolicy({ required: next.requireAssetCache, getSummary: assetCache.currentSummary });
+    assetCache.setLimits(next.assetCacheLimits ?? fallbackAssetCacheLimits);
+    // A persisted owner setting overrides the startup/env fallback and is applied by the
+    // existing private settings poll; an absent field keeps the normal emergency option.
+    bandwidthEmergency?.setEnabled(next.bandwidthEmergencyEnabled ?? emergencyOptions.enabled);
+    // Runtime enabling fails closed until a summary is ready; ordinary optional startup stays lazy.
+    if (next.requireAssetCache && !assetCache.currentSummary()) void warmAssetSummary();
+  }
+  applySettings(serverSettings.get());
+  if (serverSettings.get().requireAssetCache) await warmAssetSummary();
   // the plugin studio (DESIGN §32.9): its page and API for this machine and the local network; it watches plugins/ only
   // once it is used (hot reload), and rooms whose host is the author or alone follow a plugin's changes by themselves
   const studio = opts.studio === false ? null : createStudio({ publicDir, pluginsDir, dataDir, registry: packs, lobby, sessions: registry, log, fetch: opts.fetch });
@@ -138,9 +178,38 @@ export async function startServer(opts = {}) {
   buildTag();
 
   const traffic = createTrafficCounter();
-  const server = http.createServer(createRequestHandler({ serveStatic, csp: process.env.SP_CSP === 'off' ? null : siteCsp(publicDir), health: { startedAt, network, registry, lobby, content, traffic, assetIndex, views, trusted:trustedRuntime?.health }, log, trustProxy: network.opts.trustProxy, studio, trustedRuntime }));
+  let requestHandler;
+  const bandwidthEmergencyEnabled = serverSettings.get().bandwidthEmergencyEnabled ?? emergencyOptions.enabled;
+  bandwidthEmergency = createBandwidthEmergencyController({
+    ...(opts.bandwidthEmergency || {}), ...emergencyOptions, enabled: bandwidthEmergencyEnabled,
+    getMetrics: () => assetCache.metrics(), getCongestion: () => network.congestion(),
+    canResume: () => [...lobby.rooms.values()].every((room) => !room.match || room.activeHumans().some((seat) => seat.connected)),
+    log,
+    onChange: (state) => {
+      if (state.active) {
+        assetCache.trip(state.reason);
+        requestHandler?.abortPublicRequests();
+        // `finish` only means handed to TCP, not delivered. Close ordinary HTTP sockets too,
+        // including finished keep-alive transfers; Node deliberately excludes upgraded WebSockets.
+        server.closeAllConnections?.();
+      } else assetCache.resume();
+      network.setEmergency(state);
+      lobby.setEmergency(state);
+      log.warn(`[bandwidth-emergency] ${state.active ? state.action === 'retry-delayed'
+        ? '现有对局仍未具备恢复条件，继续保护' : '保护开启，下载和新访问已切断，对局冻结'
+        : '尝试恢复访问和对局'} (${state.reason || 'recovery'})`);
+    },
+  });
+  requestHandler = createRequestHandler({ serveStatic, announcements, assetCache,
+    emergency: () => network.emergency, csp: process.env.SP_CSP === 'off' ? null : siteCsp(publicDir),
+    health: { startedAt, network, registry, lobby, content, traffic, assetIndex, views, trusted:trustedRuntime?.health },
+    log, trustProxy: network.opts.trustProxy, studio, trustedRuntime });
+  const server = http.createServer(requestHandler);
   server.on('clientError', answerClientError);
   const wss = attachWebSocket(server, { network, log, traffic });
+  // Prime before accepting connections; only commands submitted to a running server are broadcast.
+  announcementNotices.start();
+  serverSettings.start();
 
   // The address actually bound. The default may fall back to IPv4; the returned host and url follow that.
   let boundHost;
@@ -186,6 +255,8 @@ export async function startServer(opts = {}) {
     network.close(); // stop heartbeat/sweep timers of the half-built server
     assetIndex?.close();
     studio?.close();
+    serverSettings.close();
+    announcementNotices.close();
     await trustedRuntime?.close();
     throw e;
   }
@@ -205,6 +276,9 @@ export async function startServer(opts = {}) {
       network.close();
       assetIndex?.close();
       studio?.close();
+      serverSettings.close();
+      announcementNotices.close();
+      bandwidthEmergency?.close();
       await trustedRuntime?.close();
       await new Promise((resolve) => {
         server.close(() => resolve());
@@ -216,7 +290,8 @@ export async function startServer(opts = {}) {
     return closing;
   }
 
-  return { port: actualPort, host: boundHost, url, server, wss, lobby, network, registry, packs, content, visual, contents, hosts, traffic, assetIndex, views, studio, close };
+  return { port: actualPort, host: boundHost, url, server, wss, lobby, network, registry, packs, content, visual, contents, hosts, traffic, assetIndex, views, studio,
+    announcements, serverSettings, assetCache, bandwidthEmergency, close };
 }
 
 // `node server/index.js` / npm start: listen, print the banner, stop on SIGINT / SIGTERM (http/boot.js).

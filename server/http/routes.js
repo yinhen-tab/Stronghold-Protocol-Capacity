@@ -20,6 +20,10 @@
 import { PROTOCOL_VERSION, APP_VERSION } from '../../shared/constants.js';
 import { buildTag } from './buildTag.js';
 import { setSecurityHeaders, sendError, sendJson, splitUrl } from './common.js';
+import { isAnnouncementId } from '../../shared/announcements.js';
+import { ANNOUNCEMENT_ASSET_URL_PREFIX } from '../../shared/announcementAssets.js';
+import { serveAnnouncementAsset } from './announcementAssets.js';
+import { ASSET_CACHE_PREFIX } from './assetCache.js';
 import { clientAddress, isLocalIp } from '../net.js';
 
 const MAX_URL_LENGTH = 4096;
@@ -81,7 +85,8 @@ const wantsTraffic = (query) => /(?:^|&)traffic(?:=(?:1|true|yes))?(?:&|$)/i.tes
  *   plugin studio (server/studio/index.js), or none
  * @returns {(req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void}
  */
-export function createRequestHandler({ serveStatic, health, log, trustProxy = 'auto', studio = null, csp = null, trustedRuntime = null }) {
+export function createRequestHandler({ serveStatic, health, log, announcements = null, assetCache = null,
+  emergency = () => null, trustProxy = 'auto', studio = null, csp = null, trustedRuntime = null }) {
   async function handleRequest(req, res) {
     const url = req.url || '/';
     if (url.length > MAX_URL_LENGTH) { sendError(req, res, 414, '请求地址过长 · URI too long'); return; }
@@ -97,6 +102,39 @@ export function createRequestHandler({ serveStatic, health, log, trustProxy = 'a
     if (parts.rawPath === '/healthz') {
       const withTraffic = wantsTraffic(parts.query) && isLocalIp(clientAddress(req, trustProxy).ip);
       sendJson(req, res, 200, healthReport(health, withTraffic));
+      return;
+    }
+    // the bandwidth emergency (server/bandwidthEmergency.js): while it protects the server, ordinary requests are
+    // refused with a Retry-After — the running matches keep their own clocks (the match freezes them instead).
+    const protection = emergency();
+    if (protection?.active) {
+      const seconds = protection.retryAt ? Math.max(1, Math.ceil((protection.retryAt - Date.now()) / 1000)) : 120;
+      res.setHeader('Retry-After', String(seconds));
+      res.setHeader('Connection', 'close');
+      sendJson(req, res, 503, { error: parts.rawPath.startsWith(ASSET_CACHE_PREFIX)
+        ? 'ASSET_CACHE_EMERGENCY' : 'SERVER_EMERGENCY', emergency: true, retryAfterSec: seconds });
+      return;
+    }
+    // the asset cache (server/http/assetCache.js): the installation's own copy of the art, served on demand
+    if (parts.rawPath.startsWith(ASSET_CACHE_PREFIX)) {
+      if (!assetCache) { sendJson(req, res, 503, { error: 'ASSET_CACHE_UNAVAILABLE' }); return; }
+      await assetCache.serve(req, res, parts.rawPath, parts.query);
+      return;
+    }
+    // the owner's announcements (server/announcements.js): the list and one article, plus its pictures
+    if (parts.rawPath === '/api/announcements') {
+      sendJson(req, res, 200, announcements?.list() || { revision: '', pinnedId: null, items: [] });
+      return;
+    }
+    if (parts.rawPath.startsWith('/api/announcements/')) {
+      let id;
+      try { id = decodeURIComponent(parts.rawPath.slice('/api/announcements/'.length)); } catch { /* invalid URL */ }
+      const article = isAnnouncementId(id) ? announcements?.read(id) : null;
+      sendJson(req, res, article ? 200 : 404, article || { error: 'ANNOUNCEMENT_NOT_FOUND' });
+      return;
+    }
+    if (parts.rawPath === ANNOUNCEMENT_ASSET_URL_PREFIX.slice(0, -1) || parts.rawPath.startsWith(ANNOUNCEMENT_ASSET_URL_PREFIX)) {
+      await serveAnnouncementAsset(req, res, parts.rawPath.slice(ANNOUNCEMENT_ASSET_URL_PREFIX.length), announcements, log);
       return;
     }
     await serveStatic(req, res, parts.rawPath, parts.query);
