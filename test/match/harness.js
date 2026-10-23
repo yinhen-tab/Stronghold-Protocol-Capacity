@@ -171,7 +171,6 @@ export function checkInvariants(m) {
 
 /** The original harness checks (kept alongside collectViolations; they must agree). */
 function legacyInvariants(m) {
-  const pool = m.pool;
   // Each fixed pool group conserves its own copies.
   const heldByPool = new Map(m.poolGroups.map((g) => [g.pool, new Map()]));
   const uids = new Set();
