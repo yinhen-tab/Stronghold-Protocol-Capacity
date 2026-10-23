@@ -33,7 +33,7 @@ import { PROTOCOL_VERSION, ERR_TEXT } from '../../shared/constants.js';
 import { validateC2S } from '../../shared/protocol.js';
 import { WIRE_VERSION, encodeWire, decodeWire } from '../../shared/wireCodec.js';
 import { N_ } from '../../shared/i18n.js';
-import { assetCache } from './assetCacheManager.js';
+import { assetCache } from './assetCache.js';
 
 const ASSET_ADMISSION_TYPES = new Set(['room.create', 'room.join', 'lobby.quickMatch', 'room.spectate', 'lobby.join', 'lobby.spectate']);
 

@@ -170,7 +170,9 @@ export function generateDraft(gd, rng, round, { stageId = null, bondAvailable = 
  * Naturally identical pages are allowed, as are single-card overlaps and repeated positions within a page.
  * `bondAvailable(bondId, group)` and `itemAvailable(itemId, group)` retain the caller's eligibility for that page.
  * A group with no eligible cards is omitted, so its empty page can finish without skipping other groups' choices.
- * @returns {Array<{id: number, family: string, name: string, desc: string, eventId: string|null, cards: object[]}>}
+ * When NO group could produce a card, the result is null rather than an empty list: an empty list would read as
+ * "there are no groups" and hide the fact that the card data cannot generate any reward at all.
+ * @returns {Array<{id: number, family: string, name: string, desc: string, eventId: string|null, cards: object[]}>|null}
  */
 export function generateGroupDrafts(gd, rng, round, groups, { stageId = null, bondAvailable = null, itemAvailable = null } = {}) {
   if (!groups.length) return [];
@@ -186,7 +188,7 @@ export function generateGroupDrafts(gd, rng, round, groups, { stageId = null, bo
     if (!draft) continue;
     drafts.push({ id: group.id, ...draft });
   }
-  return drafts;
+  return drafts.length ? drafts : null;
 }
 
 /** Bond granted by a 驰援 tactic card (effect buff single_special_choice_gain_bond_chess), else null. */

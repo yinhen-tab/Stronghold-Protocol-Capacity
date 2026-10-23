@@ -138,7 +138,7 @@ test('announcement asset cache validators revalidate query URLs and notice same-
   });
 });
 
-test('announcement assets retain byte ranges, HEAD ranges, If-Range, and unsatisfiable range responses', async () => {
+test('announcement assets retain byte ranges, ignore Range on HEAD, If-Range, and unsatisfiable range responses', async () => {
   await withServer(async (srv, { assets }) => {
     fs.writeFileSync(path.join(assets, 'banner.png'), IMAGE_BYTES);
     const full = await request(srv, PREFIX + 'banner.png');
@@ -149,11 +149,13 @@ test('announcement assets retain byte ranges, HEAD ranges, If-Range, and unsatis
     assert.equal(partial.headers['content-length'], '3');
     assert.equal(partial.headers['content-type'], 'image/png');
     assert.equal(partial.headers['cache-control'], 'no-cache');
+    // HEAD ignores Range (upstream 0.3.1's fix(http): ignore Range on non-GET requests): the response
+    // carries the full body's headers, never a Content-Range.
     const head = await request(srv, PREFIX + 'banner.png', { method: 'HEAD', headers: { range: 'bytes=1-3' } });
-    assert.equal(head.status, 206);
+    assert.equal(head.status, 200);
     assert.equal(head.body.length, 0);
-    assert.equal(head.headers['content-range'], partial.headers['content-range']);
-    assert.equal(head.headers['content-length'], '3');
+    assert.equal(head.headers['content-range'], undefined);
+    assert.equal(head.headers['content-length'], String(IMAGE_BYTES.length));
     const stale = await request(srv, PREFIX + 'banner.png', { headers: { range: 'bytes=1-3', 'if-range': '"old-version"' } });
     assert.equal(stale.status, 200);
     assert.deepEqual(stale.body, IMAGE_BYTES);

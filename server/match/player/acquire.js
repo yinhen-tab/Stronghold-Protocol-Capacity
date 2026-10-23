@@ -182,7 +182,11 @@ export class PlayerAcquire {
     if (!rec || rec.isGolden) return false;
     const gid = rec.upgradeChessId || rec.goldenId;
     if (!gid || !this.gd.item(gid)) return false;
-    if (this.m.itemPoolFor(this).left(piece.id) < 1) return false;
+    // A fixed gifted piece (the noPool marker) upgrades even when its group's stock is exhausted — the upgrade
+    // inherits the gift's identity (D034: the fixed gift's upgrade / merge identity follows the existing rules
+    // combined with the upstream fix).
+    const exempt = piece.noPool === true && this.gd.isTraitFixedItem(piece.id);
+    if (!exempt && this.m.itemPoolFor(this).left(piece.id) < 1) return false;
     piece.id = gid;
     this.recompute();
     return true;
@@ -269,12 +273,14 @@ export class PlayerAcquire {
    * is actually kept, record the copies that did not fit (`need` minus `left` before the gain). A failed stow or
    * merge records nothing. Fixed gift families stay unlimited without a debt entry. Every other grant still refuses.
    */
-  acquireItem(itemId, { source = 'grant', toTemp = false, silent = false, deferMerge = false, requirePool = true, displayed = false } = {}) {
+  acquireItem(itemId, { source = 'grant', toTemp = false, silent = false, deferMerge = false, requirePool = true, noPool = false, displayed = false } = {}) {
     const rec = this.gd.item(itemId);
     if (!rec) return null;
     // Only the fixed operator-gift families can overdraw. Several unrelated strategy grants also pass
     // requirePool:false; they must retain their stock limit (for example commercial packaging).
-    const unlimitedGift = !requirePool && this.gd.isUnlimitedGiftItem(itemId);
+    // The upstream marker (noPool) names the same exemption: the piece carries the identity, so a later
+    // upgrade / merge inherits it (D034).
+    const unlimitedGift = (noPool === true || !requirePool) && this.gd.isUnlimitedGiftItem(itemId);
     const pool = this.m.itemPoolFor(this);
     const leftBefore = pool.left(itemId);
     const need = pool.need(itemId);
@@ -282,7 +288,7 @@ export class PlayerAcquire {
       this.m.toast(this, 'warn', '装备库存不足，未获得该装备');
       return null;
     }
-    let piece = this.newPiece('item', itemId);
+    let piece = this.newPiece('item', itemId, unlimitedGift ? { noPool: true } : {});
     // A prep-end grant may sit beside an identical copy until the next prep. The invariant counts only copies
     // without this mark, so the fight that is about to start is not reported as a missed merge.
     if (deferMerge) piece.deferMerge = true;
@@ -309,7 +315,10 @@ export class PlayerAcquire {
     for (const l of locs) { if (consumed.length >= need) break; consumed.push(l); }
     if (consumed.length < need) return null;
     for (const l of consumed) if (l.area !== 'new') this._detach(l);
-    const golden = this.newPiece('item', rec.upgradeChessId || rec.goldenId);
+    // The merged piece inherits the fixed gift's identity when every consumed piece carried the marker
+    // (D034: the fixed gift's upgrade / merge identity follows the existing rules combined with the upstream fix).
+    const golden = this.newPiece('item', rec.upgradeChessId || rec.goldenId,
+      consumed.every((l) => l.piece.noPool) ? { noPool: true } : {});
     this.stow(golden, { allowTemp: true });
     this.stats.itemMerges++;
     this.m.dispatch(this, 'onMerge', { kind: 'item', piece: golden, itemId, consumed: consumed.map((l) => l.piece.uid) });
