@@ -19,7 +19,9 @@ export const DELAYS = Object.freeze({
   SETTLE: 3000,
   BOT_ACTION: 900,
   BOT_STAGGER: 350,
-  PUBLIC_THROTTLE: 100,
+  // 8 Hz: the capacity layer broadcasts m.public to up to twenty seats (five fixed groups) instead of four, so the
+  // shared-view throttle is 125 ms here where the four-seat upstream used 100 ms.
+  PUBLIC_THROTTLE: 125,
 });
 
 /**

@@ -312,8 +312,13 @@ export class Match {
     this.gd = new GameData(this.data, this.modeId);
     if (!this.difficulty) this.difficulty = this.gd.difficulty;
     this.isSolo = this.mode === 'solo' || this.gd.isSolo;
-    /** 「AI 队友最后选择」 (opts.aiPicksLast, GitHub #338): humans draft before AI seats (MatchPhases.humansFirst) */
-    this.aiPicksLast = !this.isSolo && opts.aiPicksLast === true;
+    /**
+     * Manual-player priority inside each fixed pool group (D004 / D012). Co-op always enables it — online,
+     * connected, manually playing humans draft before autoplay, disconnected and AI seats; solo has no order to
+     * prefer. Upstream's `opts.aiPicksLast` (GitHub #338, 「AI 队友最后选择」) is accepted for compatibility only:
+     * the capacity layer supersedes it, so the option value changes no order and no random stream.
+     */
+    this.aiPicksLast = !this.isSolo;
     this.ownsScheduler = !opts.scheduler;
     this.sched = new FreezeScheduler(opts.scheduler || new RealScheduler({ now: opts.now || Date.now, onError: (e) => this.reportError('timer', e) }), { ownsSource: this.ownsScheduler });
     this.registry = opts.registry || getDefaultRegistry();
