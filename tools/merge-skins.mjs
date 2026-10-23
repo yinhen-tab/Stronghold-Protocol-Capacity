@@ -83,13 +83,25 @@ function artSource(skin, artDir) {
 }
 
 /**
- * The 1:2 portrait of a skin, when tools/fetch-skin-portraits.py has stored one. The catalogue's own
- * entries only carry the 180x180 avatar, which the picker's 1:2 tile cannot fill.
+ * The 1:2 portrait of a skin. `data/skin-portraits/<id>.webp` (19 MB, committed) wins over whatever
+ * tools/fetch-skin-portraits.py left in public/assets, so a fresh clone gets portraits from git alone —
+ * no Python on the build host. Returns the URL to record plus the file to copy, or null.
  */
-function portraitUrl(skinId) {
-  const name = skinId.replace(/[@#]/g, '_') + '.png';
+function portraitFor(skinId) {
+  const base = skinId.replace(/[@#]/g, '_');
+  const name = base + '.webp';
   const rel = `char/skin_portrait/${name}`;
-  return existsSync(join(ASSETS, rel)) ? `/assets/${rel}` : null;
+  const shipped = join(ROOT, 'data', 'skin-portraits', name);
+  if (existsSync(shipped)) {
+    // always copy: the committed WebP is the source of truth, an older run may have left a
+    // different size in public/assets
+    return { url: `/assets/${rel}`, rel, from: shipped };
+  }
+  for (const ext of ['.webp', '.png']) {
+    const r = `char/skin_portrait/${base}${ext}`;
+    if (existsSync(join(ASSETS, r))) return { url: `/assets/${r}`, rel: r, from: null };
+  }
+  return null;
 }
 
 async function main() {
@@ -116,14 +128,21 @@ async function main() {
         // the entry is there but its art may have been pruned with public/assets: put it back
         const art = artSource(skin, artDir);
         if (art && art.from) wanted.set(art.rel, art.from);
-        const pic = portraitUrl(skinId);
-        if (pic && !mine.skins[skinId].portrait) { mine.skins[skinId] = { ...mine.skins[skinId], portrait: pic }; skinsPictured += 1; }
+        const pic = portraitFor(skinId);
+        if (pic) {
+          if (pic.from) wanted.set(pic.rel, pic.from);
+          if (mine.skins[skinId].portrait !== pic.url) {
+            mine.skins[skinId] = { ...mine.skins[skinId], portrait: pic.url };
+            skinsPictured += 1;
+          }
+        }
         continue;
       }
       const art = artSource(skin, artDir);
       if (art && art.missing && !opts.all) { skinsNoArt += 1; continue; }
-      const pic = portraitUrl(skinId);
-      mine.skins[skinId] = pic && !skin.portrait ? { ...skin, portrait: pic } : skin;
+      const pic = portraitFor(skinId);
+      if (pic && pic.from) wanted.set(pic.rel, pic.from);
+      mine.skins[skinId] = pic ? { ...skin, portrait: pic.url } : skin;
       if (pic) skinsPictured += 1;
       skinsAdded += 1;
       touched = true;
