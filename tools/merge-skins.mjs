@@ -82,6 +82,16 @@ function artSource(skin, artDir) {
   return null;
 }
 
+/**
+ * The 1:2 portrait of a skin, when tools/fetch-skin-portraits.py has stored one. The catalogue's own
+ * entries only carry the 180x180 avatar, which the picker's 1:2 tile cannot fill.
+ */
+function portraitUrl(skinId) {
+  const name = skinId.replace(/[@#]/g, '_') + '.png';
+  const rel = `char/skin_portrait/${name}`;
+  return existsSync(join(ASSETS, rel)) ? `/assets/${rel}` : null;
+}
+
 async function main() {
   const { chars, artDir } = await loadCatalogue();
   const cur = JSON.parse(await readFile(MANIFEST, 'utf8'));
@@ -91,6 +101,7 @@ async function main() {
   let skinsAdded = 0;
   let skinsKept = 0;
   let skinsNoArt = 0;
+  let skinsPictured = 0;
   const wanted = new Map(); // rel under public/assets -> file to copy
 
   for (const [charId, skins] of Object.entries(chars)) {
@@ -105,11 +116,15 @@ async function main() {
         // the entry is there but its art may have been pruned with public/assets: put it back
         const art = artSource(skin, artDir);
         if (art && art.from) wanted.set(art.rel, art.from);
+        const pic = portraitUrl(skinId);
+        if (pic && !mine.skins[skinId].portrait) { mine.skins[skinId] = { ...mine.skins[skinId], portrait: pic }; skinsPictured += 1; }
         continue;
       }
       const art = artSource(skin, artDir);
       if (art && art.missing && !opts.all) { skinsNoArt += 1; continue; }
-      mine.skins[skinId] = skin;
+      const pic = portraitUrl(skinId);
+      mine.skins[skinId] = pic && !skin.portrait ? { ...skin, portrait: pic } : skin;
+      if (pic) skinsPictured += 1;
       skinsAdded += 1;
       touched = true;
       if (art && art.from) wanted.set(art.rel, art.from);
@@ -145,6 +160,7 @@ async function main() {
   console.log(`source      ${artDir || CATALOG}`);
   console.log(`operators   ${charsMerged} gained skins, ${skinsAdded} added, ${skinsKept} already present`);
   if (skinsNoArt) console.log(`            ${skinsNoArt} have no art on disk and were skipped (--all to keep them)`);
+  if (skinsPictured) console.log(`portraits   ${skinsPictured} skins carry a 1:2 portrait`);
   console.log(`art         ${copied} copied` + (addedBytes ? ` (${(addedBytes / 1048576).toFixed(1)} MB)` : ''));
   console.log(`manifest    ${changed ? `hash ${oldHash} -> ${next.hash}` : 'unchanged'}`);
 
@@ -154,6 +170,27 @@ async function main() {
   await writeFile(tmp, text);
   await rename(tmp, MANIFEST);
   console.log(`wrote       ${MANIFEST}`);
+
+  // Keep the in-repo catalogue in step with what the manifest now holds, so the next
+  // `fetch-assets` run can be repaired with this script alone (art + portraits included).
+  const rebuilt = {};
+  for (const [cid, rec] of Object.entries(body.chars || {})) {
+    if (rec && rec.skins && Object.keys(rec.skins).length) rebuilt[cid] = rec.skins;
+  }
+  const prevCat = existsSync(CATALOG) ? JSON.parse(await readFile(CATALOG, 'utf8')) : {};
+  const catText = JSON.stringify({
+    about: prevCat.about
+      || 'Picture-only skins shipped with this checkout: entries of data/assets.json chars[*].skins that have art '
+       + 'in data/skins-art/. tools/merge-skins.mjs merges them back into data/assets.json after a fetch-assets run.',
+    count: Object.values(rebuilt).reduce((n, r) => n + Object.keys(r).length, 0),
+    chars: rebuilt,
+  });
+  if (catText !== JSON.stringify(prevCat)) {
+    const ctmp = CATALOG + '.tmp';
+    await writeFile(ctmp, catText);
+    await rename(ctmp, CATALOG);
+    console.log(`wrote       ${CATALOG}`);
+  }
 }
 
 main().catch((err) => { console.error(err); process.exit(1); });
