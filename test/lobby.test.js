@@ -19,7 +19,7 @@ import { sanitizeName, TokenBucket, SessionRegistry, clientAddress, normalizeIp,
 import { StubMatch as Match } from '../server/match/StubMatch.js';
 import { Match as RealMatch } from '../server/match/Match.js';
 import { TestClient } from './helpers/wsClient.js';
-import { ERR, MAX_SEATS, MAX_SPECTATORS, PHASE, EMOTES } from '../shared/constants.js';
+import { ERR, BASE_SEATS, MAX_SEATS, MAX_SPECTATORS, PHASE, EMOTES } from '../shared/constants.js';
 
 const CODE_RE = new RegExp(`^[${CODE_ALPHABET}]{4}$`);
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
@@ -68,7 +68,7 @@ function clientPool(getUrl) {
 }
 
 async function createRoom(c, mode = 'coop', difficulty = 'NORMAL') {
-  const r = await c.request({ t: 'room.create', mode, difficulty });
+  const r = await c.request({ t: 'room.create', mode, difficulty, capacity: BASE_SEATS });
   assert.equal(r.t, 'ok', JSON.stringify(r));
   return c.waitFor('room.state', (s) => s.hostId === c.id && s.mode === mode);
 }
@@ -601,7 +601,7 @@ describe('websocket lobby', () => {
     await expectError(c, { t: 'room.join', code: 'AB CD' }, ERR.BAD_MSG);
     await expectError(c, { t: 'room.join', code: { $gt: '' } }, ERR.BAD_MSG);
     await expectError(c, { t: 'room.ready', ready: 'yes' }, ERR.BAD_MSG);
-    await expectError(c, { t: 'room.removeBot', seat: 9 }, ERR.BAD_MSG);
+    await expectError(c, { t: 'room.removeBot', seat: MAX_SEATS }, ERR.BAD_MSG);
     await expectError(c, { t: 'g.buy', slot: -1 }, ERR.BAD_MSG);
     await expectError(c, { t: 'g.move', uid: 1, to: { area: 'moon' } }, ERR.BAD_MSG);
     await expectError(c, { t: 'ping', c: 'x' }, ERR.BAD_MSG);
@@ -681,7 +681,7 @@ describe('websocket lobby', () => {
     assert.equal(st.mode, 'coop');
     assert.equal(st.difficulty, 'HARD');
     assert.equal(st.inMatch, false);
-    assert.equal(st.seats.length, MAX_SEATS);
+    assert.equal(st.seats.length, BASE_SEATS);
     assert.deepEqual(st.seats[0], { seat: 0, playerId: host.id, name: 'Host', isBot: false, ready: false, connected: true });
     assert.deepEqual(st.seats.slice(1), [null, null, null]);
 
@@ -879,13 +879,13 @@ describe('websocket lobby', () => {
     await expectOk(host, { t: 'room.leave' });
     const migrated = await a.waitFor('room.state', (s) => s.hostId !== host.id);
     assert.equal(migrated.hostId, a.id, 'lowest remaining seat becomes host');
-    assert.equal(migrated.seats[0], null);
+    assert.equal(migrated.seats[0]?.playerId, a.id, 'the waiting-room host moves to P1');
     await b.waitFor('room.state', (s) => s.hostId === a.id);
 
-    // new joiner takes the lowest free seat (0); host stays with A
+    // new joiner takes the lowest free seat (1); host stays with A at P1
     const c = await pool.player('C');
     const joined = await joinRoom(c, st.code);
-    assert.equal(seatOf(joined, c.id).seat, 0);
+    assert.equal(seatOf(joined, c.id).seat, 1);
     assert.equal(joined.hostId, a.id);
     await expectOk(a, { t: 'room.addBot' });
     const withBot = await c.waitFor('room.state', (s) => s.seats[3]?.isBot);
@@ -1332,7 +1332,7 @@ describe('lobby timers and match interface', () => {
     await joinRoom(guest, st.code);
     await host.terminate();
     const migrated = await guest.waitFor('room.state', (s) => s.hostId === guest.id, GRACE + 1000);
-    assert.equal(migrated.seats[0], null);
+    assert.equal(migrated.seats[0]?.playerId, guest.id);
     await expectOk(guest, { t: 'room.addBot' });
   });
 
@@ -1539,8 +1539,11 @@ describe('lobby timers and match interface', () => {
     assert.ok(freed);
   });
 
-  test('a dropped solo run keeps the official singleReconnectTime (24 h), not the 10-minute window', () => {
-    assert.equal(srv.lobby.soloResumeWindowMs(), 86_400 * 1000, 'data config.constants.singleReconnectTime');
+  test('a dropped solo run keeps this branch\'s 2-hour solo window (D033), not the 10-minute window', () => {
+    // D033 (2026-10-14, the user's decision): LOBBY_DEFAULTS.soloReconnectWindowMs overrides the official
+    // singleReconnectTime (24 h) down to 2 h, because solo rooms left by a disconnected host piled up in the
+    // lobby. The generated data and the research records keep the official figure.
+    assert.equal(srv.lobby.soloResumeWindowMs(), 2 * 60 * 60 * 1000, 'LOBBY_DEFAULTS.soloReconnectWindowMs');
     assert.ok(srv.lobby.soloResumeWindowMs() > WINDOW);
   });
 });
